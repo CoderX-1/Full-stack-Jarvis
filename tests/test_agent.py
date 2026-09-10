@@ -1,0 +1,144 @@
+import asyncio
+import os
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+import agent
+
+
+class ProviderConfigTests(unittest.TestCase):
+    def test_gemini_is_inferred_from_its_key(self):
+        env = {
+            "GEMINI_API_KEY": "test-key",
+            "OPENAI_API_KEY": "",
+            "AI_API_KEY": "",
+            "AI_PROVIDER": "",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            config = agent.ProviderConfig.from_env()
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.base_url, agent.GEMINI_BASE_URL)
+        self.assertTrue(config.model.startswith("gemini-"))
+
+    def test_custom_provider_requires_base_url(self):
+        with patch.dict(os.environ, {"AI_API_KEY": "test", "AI_BASE_URL": ""}, clear=True):
+            with self.assertRaisesRegex(ValueError, "AI_BASE_URL"):
+                agent.ProviderConfig.from_env("compatible", "model")
+
+    def test_openai_automatically_gets_gemini_fallback(self):
+        env = {
+            "OPENAI_API_KEY": "openai-test-key",
+            "GEMINI_API_KEY": "gemini-test-key",
+            "AI_FALLBACK_PROVIDER": "",
+            "AI_MODEL": "",
+            "GEMINI_MODEL": "gemini-test-model",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            primary = agent.ProviderConfig.from_env("openai", "openai-test-model")
+            fallback = agent.fallback_config_from_env(primary)
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.provider, "gemini")
+        self.assertEqual(fallback.model, "gemini-test-model")
+
+
+class FakeAgent(agent.LocalAgent):
+    def __init__(self, *args, replies, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.replies = iter(replies)
+
+    async def _request(self):
+        return next(self.replies)
+
+
+class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_call_writes_and_returns_final_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = agent.ProviderConfig("openai", "test", agent.OPENAI_BASE_URL, "test-model")
+            replies = [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path":"hello.txt","content":"hello"}',
+                            },
+                        }
+                    ],
+                },
+                {"content": "Done."},
+            ]
+            runner = FakeAgent(config, root, "instructions", auto_approve=True, replies=replies)
+            answer = await runner.ask("write it")
+            self.assertEqual(answer, "Done.")
+            self.assertEqual((root / "hello.txt").read_text(), "hello")
+            self.assertEqual(runner.messages[-2]["role"], "tool")
+
+    async def test_mutating_tool_is_denied_without_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = agent.ProviderConfig("openai", "test", agent.OPENAI_BASE_URL, "test-model")
+            runner = agent.LocalAgent(config, root, "instructions")
+            result = await runner._run_tool("write_file", {"path": "no.txt", "content": "no"})
+            self.assertEqual(result, "denied by user")
+            self.assertFalse((root / "no.txt").exists())
+
+
+class HttpRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_completions_endpoint_and_bearer_auth(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"role":"assistant","content":"hello"}}]}'
+
+        config = agent.ProviderConfig("gemini", "secret-test-key", "https://example.test/v1", "test-model")
+        runner = agent.LocalAgent(config, Path.cwd(), "instructions")
+        with patch("urllib.request.urlopen", return_value=Response()) as mocked:
+            message = await runner._request()
+        request = mocked.call_args.args[0]
+        payload = __import__("json").loads(request.data)
+        self.assertEqual(request.full_url, "https://example.test/v1/chat/completions")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-key")
+        self.assertEqual(payload["model"], "test-model")
+        self.assertEqual(message["content"], "hello")
+
+    async def test_failed_openai_request_switches_to_gemini(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"role":"assistant","content":"fallback"}}]}'
+
+        primary = agent.ProviderConfig("openai", "openai-key", "https://openai.test/v1", "gpt-test")
+        fallback = agent.ProviderConfig("gemini", "gemini-key", "https://gemini.test/v1", "gemini-test")
+        runner = agent.LocalAgent(
+            primary,
+            Path.cwd(),
+            "instructions",
+            fallback_config=fallback,
+        )
+        failure = urllib.error.URLError("offline")
+        with patch("urllib.request.urlopen", side_effect=[failure, Response()]) as mocked:
+            message = await runner._request()
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(runner.config.provider, "gemini")
+        self.assertEqual(message["content"], "fallback")
+
+
+if __name__ == "__main__":
+    unittest.main()
