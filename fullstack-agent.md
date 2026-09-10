@@ -14,7 +14,7 @@ Ground rules, binding for the whole run:
 **Choose the brain first.** Ask which API they have: OpenAI, Gemini, or another OpenAI-compatible service. Never ask them to paste a secret into chat and never write an API key into a repo or JSON config. The runner reads credentials from the environment:
 
 - OpenAI: `OPENAI_API_KEY`; optional `AI_MODEL` (default `gpt-5.2`).
-- Gemini: `GEMINI_API_KEY`; optional `AI_MODEL` (default `gemini-3.8-flash`). Gemini uses `https://generativelanguage.googleapis.com/v1beta/openai`, so the same client and tool loop work for both.
+- Gemini: `GEMINI_API_KEY`; optional `AI_MODEL` (default `gemini-3.7-flash`). Gemini uses `https://generativelanguage.googleapis.com/v1beta/openai`, so the same client and tool loop work for both.
 - Compatible service: `AI_PROVIDER=compatible`, `AI_API_KEY`, `AI_BASE_URL`, and `AI_MODEL`.
 
 Check only whether the relevant variable exists; never print its value. If it is missing, explain where the provider issues keys and wait while the person sets it in their terminal. Re-run `agent.py` from that terminal so the child process receives the variable. Record only the provider, model, and optional base URL for later wiring.

@@ -1,0 +1,12 @@
+
+Starting Jarvis...
+
+Jarvis is ready.
+Hold the HOME key, speak, then release it.
+Close this window to stop the voice.
+
+[backtalk] up — agent=Jarvis dir=C:/Projects model=gpt-5.2 mic=push-to-talk (home) (say 'goodbye jarvis' to hang up)
+[backtalk] connecting the brain...
+[backtalk] BRAIN CONNECT failed: ValueError('No API key found. Set OPENAI_API_KEY in your environment.')
+[ears] loading small (cpu/int8)...
+[ears] model ready (faster-whisper)

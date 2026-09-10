@@ -45,6 +45,8 @@ class BacktalkPatchTests(unittest.TestCase):
             self.assertEqual(config.count('"provider": "openai"'), 1)
             self.assertIn('"fullstack-agent-main" / "agent.py"', brain)
             self.assertIn("sys.path.insert(0, runner_dir)", brain)
+            self.assertIn("unavailable at startup", brain)
+            self.assertIn("ProviderConfig.from_env(provider=fallback)", brain)
             self.assertTrue((root / "PROVIDER_COMPATIBILITY.md").is_file())
 
 

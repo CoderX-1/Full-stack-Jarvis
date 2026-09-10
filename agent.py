@@ -81,7 +81,7 @@ class ProviderConfig:
         if name == "gemini":
             key = os.getenv("GEMINI_API_KEY") or os.getenv("AI_API_KEY") or ""
             url = base_url or os.getenv("AI_BASE_URL") or GEMINI_BASE_URL
-            chosen_model = model or os.getenv("AI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+            chosen_model = model or os.getenv("AI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-3.7-flash"
             key_name = "GEMINI_API_KEY"
         elif name == "openai":
             key = os.getenv("OPENAI_API_KEY") or os.getenv("AI_API_KEY") or ""
@@ -305,8 +305,25 @@ class LocalAgent:
         return choices[0].get("message") or {}
 
     async def _request(self) -> dict[str, Any]:
+        async def request_with_transient_retries(config: ProviderConfig) -> dict[str, Any]:
+            last_error: RuntimeError | None = None
+            for attempt in range(3):
+                try:
+                    return await self._request_with(config)
+                except RuntimeError as exc:
+                    last_error = exc
+                    detail = str(exc)
+                    transient = any(
+                        marker in detail
+                        for marker in ("(429)", "(500)", "(502)", "(503)", "(504)")
+                    )
+                    if not transient or attempt == 2:
+                        raise
+                    await asyncio.sleep(1.0 * (2 ** attempt))
+            raise last_error or RuntimeError("API request failed")
+
         try:
-            return await self._request_with(self.config)
+            return await request_with_transient_retries(self.config)
         except RuntimeError as primary_error:
             if not self.fallback_config:
                 raise
@@ -319,7 +336,7 @@ class LocalAgent:
                 file=sys.stderr,
             )
             try:
-                return await self._request_with(self.config)
+                return await request_with_transient_retries(self.config)
             except RuntimeError as fallback_error:
                 raise RuntimeError(
                     f"Primary provider {failed.provider} failed ({primary_error}); "

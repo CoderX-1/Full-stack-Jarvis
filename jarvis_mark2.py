@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -209,6 +211,7 @@ class Mark2Runtime:
         self.process_path = self.state_dir / "processes.json"
         self.audit_path = self.state_dir / "audit.jsonl"
         self._live_processes: dict[str, subprocess.Popen[str]] = {}
+        self._process_uses_shell: dict[str, bool] = {}
 
     def _ensure_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -248,11 +251,7 @@ class Mark2Runtime:
 
     def audit(self, tool: str, args: dict[str, Any], result: str) -> None:
         self._ensure_state()
-        safe_args = {
-            key: value
-            for key, value in args.items()
-            if key not in {"content", "new", "old", "api_key", "token", "password"}
-        }
+        safe_args = self._sanitize_for_audit(args)
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": tool,
@@ -262,6 +261,24 @@ class Mark2Runtime:
         }
         with self.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    @classmethod
+    def _sanitize_for_audit(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            safe = {}
+            for key, item in value.items():
+                normalized = str(key).casefold()
+                if normalized in {"content", "new", "old"} or any(
+                    marker in normalized
+                    for marker in ("api_key", "apikey", "password", "secret", "token")
+                ):
+                    safe[str(key)] = "[REDACTED]"
+                else:
+                    safe[str(key)] = cls._sanitize_for_audit(item)
+            return safe
+        if isinstance(value, list):
+            return [cls._sanitize_for_audit(item) for item in value]
+        return value
 
     def list_projects(self) -> str:
         projects = self._projects()
@@ -379,6 +396,21 @@ class Mark2Runtime:
             env.pop(name, None)
         return env
 
+    @staticmethod
+    def _launch_args(command: str) -> tuple[str | list[str], bool]:
+        if os.name != "nt":
+            return command, True
+        parts = shlex.split(command, posix=False)
+        parts = [
+            part[1:-1] if len(part) >= 2 and part[0] == part[-1] == '"' else part
+            for part in parts
+        ]
+        executable = shutil.which(parts[0]) if parts else None
+        if executable and Path(executable).suffix.casefold() not in {".bat", ".cmd"}:
+            parts[0] = executable
+            return parts, False
+        return command, True
+
     def open_project(self, name: str) -> str:
         project = self._get_project(name)
         path = self._safe_path(project["path"])
@@ -410,11 +442,12 @@ class Mark2Runtime:
         self._ensure_state()
         log_path = self.state_dir / f"{self._slug(project['name'])}-server.log"
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        launch_args, uses_shell = self._launch_args(command)
         with log_path.open("a", encoding="utf-8") as output:
             process = subprocess.Popen(
-                command,
+                launch_args,
                 cwd=path,
-                shell=True,
+                shell=uses_shell,
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -422,6 +455,7 @@ class Mark2Runtime:
                 creationflags=creationflags,
             )
         self._live_processes[project["name"]] = process
+        self._process_uses_shell[project["name"]] = uses_shell
         self._save_json(
             self.process_path,
             {
@@ -439,9 +473,10 @@ class Mark2Runtime:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 return f"error: project {name} exited with code {process.returncode}; log={log_path}"
-            if not url or not self.check_local_url(url).startswith("error:"):
+            health = self.check_local_url(url) if url else ""
+            if not url or not health.startswith("error:"):
                 return f"Started and verified project {name}; PID {process.pid}" + (
-                    f"; {self.check_local_url(url)}" if url else ""
+                    f"; {health}" if url else ""
                 )
             time.sleep(0.5)
         return f"error: project {name} started with PID {process.pid}, but {url} did not become ready"
@@ -451,7 +486,8 @@ class Mark2Runtime:
         process = self._live_processes.get(project["name"])
         if not process or process.poll() is not None:
             return "error: no process started by this JARVIS session is running for that project"
-        if os.name == "nt":
+        uses_shell = self._process_uses_shell.get(project["name"], False)
+        if os.name == "nt" and uses_shell:
             completed = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 text=True,
@@ -463,7 +499,12 @@ class Mark2Runtime:
                 return f"error: could not stop PID {process.pid}: {(completed.stdout or '').strip()}"
         else:
             process.terminate()
+        try:
             process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            return f"error: stop command ran, but PID {process.pid} is still active"
+        self._live_processes.pop(project["name"], None)
+        self._process_uses_shell.pop(project["name"], None)
         return f"Stopped project {name}; verified PID {process.pid} is no longer active"
 
     def project_status(self, name: str) -> str:
@@ -498,6 +539,12 @@ class Mark2Runtime:
         matches: list[str] = []
         for path in root.rglob("*"):
             if any(part in SKIP_DIRS for part in path.parts) or not path.is_file():
+                continue
+            if path.is_symlink():
+                continue
+            try:
+                path.resolve().relative_to(root)
+            except ValueError:
                 continue
             relative = str(path.relative_to(root)).replace("\\", "/")
             if needle in relative.casefold():

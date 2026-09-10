@@ -139,6 +139,20 @@ class HttpRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.config.provider, "gemini")
         self.assertEqual(message["content"], "fallback")
 
+    async def test_transient_503_is_retried_without_switching_provider(self):
+        config = agent.ProviderConfig("gemini", "key", "https://gemini.test/v1", "model")
+        runner = agent.LocalAgent(config, Path.cwd(), "instructions", fallback_config=None)
+        success = {"role": "assistant", "content": "ready"}
+        with patch.object(
+            runner,
+            "_request_with",
+            side_effect=[RuntimeError("API request failed (503): busy"), success],
+        ) as request, patch("asyncio.sleep", return_value=None) as sleep:
+            message = await runner._request()
+        self.assertEqual(message, success)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_awaited_once_with(1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

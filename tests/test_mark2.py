@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -25,12 +27,19 @@ class Mark2RegistryTests(unittest.TestCase):
 
             runtime.audit(
                 "register_project",
-                {"name": "Demo", "api_key": "never-log-this", "content": "private"},
+                {
+                    "name": "Demo",
+                    "API_KEY": "never-log-this",
+                    "content": "private",
+                    "nested": {"access_token": "also-never-log-this"},
+                },
                 result,
             )
             audit = runtime.audit_path.read_text(encoding="utf-8")
             self.assertNotIn("never-log-this", audit)
+            self.assertNotIn("also-never-log-this", audit)
             self.assertNotIn("private", audit)
+            self.assertIn("[REDACTED]", audit)
             self.assertEqual(json.loads(audit)["tool"], "register_project")
 
     def test_project_path_cannot_escape_agent_home(self):
@@ -57,6 +66,62 @@ class Mark2RegistryTests(unittest.TestCase):
             result = runtime.run_project_build("Demo")
             self.assertIn("exit code 0", result)
             self.assertIn("12345", result)
+
+    def test_child_process_does_not_inherit_jarvis_api_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Mark2Runtime(Path(tmp))
+            previous = {
+                name: os.environ.get(name)
+                for name in (
+                    "OPENAI_API_KEY",
+                    "GEMINI_API_KEY",
+                    "ELEVENLABS_API_KEY",
+                    "AI_API_KEY",
+                )
+            }
+            try:
+                for name in previous:
+                    os.environ[name] = "secret"
+                child = runtime._child_env()
+                for name in previous:
+                    self.assertNotIn(name, child)
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+    def test_real_server_start_health_status_and_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "server"
+            project.mkdir()
+            (project / "index.html").write_text("MARK II ONLINE", encoding="utf-8")
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            runtime = Mark2Runtime(home)
+            command = (
+                f'"{sys.executable}" -m http.server {port} --bind 127.0.0.1'
+            )
+            runtime.register_project(
+                "Server",
+                "server",
+                start_command=command,
+                url=f"http://127.0.0.1:{port}/",
+            )
+            started = runtime.start_project("Server", verify_timeout=15)
+            try:
+                self.assertIn("Started and verified", started)
+                self.assertIn("HTTP 200", started)
+                status = runtime.project_status("Server")
+                self.assertIn("started_by_this_session=True", status)
+                self.assertIn("HTTP 200", status)
+            finally:
+                stopped = runtime.stop_project("Server")
+            self.assertIn("verified PID", stopped)
+            self.assertFalse(runtime._live_processes)
 
 
 class Mark2PermissionTests(unittest.IsolatedAsyncioTestCase):

@@ -63,7 +63,7 @@ def _load_runner():
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None, resume_id: str | None = None):
         self.provider = str(CFG.get("provider") or os.getenv("AI_PROVIDER") or "openai").lower()
-        provider_default = "gemini-3.8-flash" if self.provider == "gemini" else "gpt-5.2"
+        provider_default = "gemini-3.7-flash" if self.provider == "gemini" else "gpt-5.2"
         self.model = model or CFG.get("model") or os.getenv("AI_MODEL") or provider_default
         self._base_url = CFG.get("base_url") or os.getenv("AI_BASE_URL") or None
         self._can_use_tool = can_use_tool
@@ -93,11 +93,24 @@ class WarmBrain:
 
     async def start(self):
         self._runner = _load_runner()
-        config = self._runner.ProviderConfig.from_env(
-            provider=self.provider,
-            model=self.model,
-            base_url=self._base_url,
-        )
+        try:
+            config = self._runner.ProviderConfig.from_env(
+                provider=self.provider,
+                model=self.model,
+                base_url=self._base_url,
+            )
+        except ValueError as exc:
+            # Request-level failover cannot help if the configured primary
+            # has no key at startup.  In that case boot directly on the
+            # configured fallback, using its own model and endpoint rather
+            # than carrying OpenAI's values across to Gemini.
+            fallback = (os.getenv("AI_FALLBACK_PROVIDER") or "").strip().lower()
+            if ("No API key found" not in str(exc) or not fallback
+                    or fallback == self.provider):
+                raise
+            log(f"[brain] {self.provider} unavailable at startup; "
+                f"using {fallback}")
+            config = self._runner.ProviderConfig.from_env(provider=fallback)
         instructions = self._runner.load_project_instructions(Path(CFG["agent_dir"]).expanduser())
         instructions = instructions + "\n\n" + DISCIPLINE
         auto = CFG.get("permission_mode") == "bypassPermissions"
@@ -109,6 +122,7 @@ class WarmBrain:
             auto_approve=auto,
         )
         self.model = config.model
+        self.provider = config.provider
         log(f"[brain] provider={config.provider} endpoint={config.base_url}")
 
     async def set_permission_mode(self, backtalk_mode: str):
