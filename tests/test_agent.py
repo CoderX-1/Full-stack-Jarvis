@@ -89,6 +89,50 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, "denied by user")
             self.assertFalse((root / "no.txt").exists())
 
+    async def test_run_command_does_not_inherit_provider_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = agent.ProviderConfig("openai", "test", agent.OPENAI_BASE_URL, "test-model")
+            runner = agent.LocalAgent(config, Path(tmp), "instructions", auto_approve=True)
+            completed = __import__("subprocess").CompletedProcess([], 0, "ok")
+            secrets = {
+                "OPENAI_API_KEY": "openai-secret",
+                "GEMINI_API_KEY": "gemini-secret",
+                "GOOGLE_API_KEY": "google-secret",
+                "ELEVENLABS_API_KEY": "voice-secret",
+                "AI_API_KEY": "compatible-secret",
+            }
+            with patch.dict(os.environ, secrets, clear=False), patch(
+                "agent.subprocess.run", return_value=completed
+            ) as mocked:
+                result = await runner._run_tool("run_command", {"command": "echo ok"})
+            self.assertIn("exit code: 0", result)
+            child_env = mocked.call_args.kwargs["env"]
+            for name in secrets:
+                self.assertNotIn(name, child_env)
+
+    async def test_failed_turn_is_removed_from_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = agent.ProviderConfig("openai", "test", agent.OPENAI_BASE_URL, "test-model")
+            runner = agent.LocalAgent(config, Path(tmp), "instructions")
+            with patch.object(runner, "_request", side_effect=RuntimeError("offline")):
+                with self.assertRaisesRegex(RuntimeError, "offline"):
+                    await runner.ask("stale question")
+            self.assertEqual([message["role"] for message in runner.messages], ["system"])
+
+    async def test_compaction_preserves_complete_recent_turns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = agent.ProviderConfig("openai", "test", agent.OPENAI_BASE_URL, "test-model")
+            runner = agent.LocalAgent(config, Path(tmp), "instructions")
+            for number in range(4):
+                runner.messages.extend([
+                    {"role": "user", "content": f"question {number}"},
+                    {"role": "assistant", "content": f"answer {number}"},
+                ])
+            runner.compact(2)
+            self.assertEqual(runner.messages[1]["content"], "question 2")
+            self.assertEqual([m["role"] for m in runner.messages[1:]],
+                             ["user", "assistant", "user", "assistant"])
+
 
 class HttpRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_completions_endpoint_and_bearer_auth(self):

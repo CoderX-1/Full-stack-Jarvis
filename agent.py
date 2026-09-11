@@ -27,11 +27,28 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 MAX_TOOL_ROUNDS = 24
 MAX_FILE_CHARS = 200_000
 MAX_COMMAND_CHARS = 40_000
+MAX_HISTORY_TURNS = 12
+
+
+def _child_env() -> dict[str, str]:
+    """Return a child-process environment without JARVIS provider secrets."""
+    env = dict(os.environ)
+    for name in (
+        "AI_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ELEVENLABS_API_KEY",
+    ):
+        env.pop(name, None)
+    return env
 
 
 def load_env_file(path: Path | None = None) -> None:
     """Load simple KEY=VALUE settings without replacing real environment values."""
-    env_path = path or Path(__file__).with_name(".env")
+    local = Path(__file__).with_name(".env")
+    workspace = Path(__file__).resolve().parent.parent / ".env"
+    env_path = path or (local if local.is_file() else workspace)
     if not env_path.is_file():
         return
     for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
@@ -86,7 +103,7 @@ class ProviderConfig:
         elif name == "openai":
             key = os.getenv("OPENAI_API_KEY") or os.getenv("AI_API_KEY") or ""
             url = base_url or os.getenv("AI_BASE_URL") or OPENAI_BASE_URL
-            chosen_model = model or os.getenv("AI_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5.2"
+            chosen_model = model or os.getenv("AI_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5-mini"
             key_name = "OPENAI_API_KEY"
         else:
             key = os.getenv("AI_API_KEY") or ""
@@ -415,6 +432,7 @@ class LocalAgent:
                         command,
                         cwd=run_cwd,
                         shell=True,
+                        env=_child_env(),
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
@@ -442,35 +460,56 @@ class LocalAgent:
             return result
 
     async def ask(self, prompt: str) -> str:
+        self.compact(MAX_HISTORY_TURNS)
+        checkpoint = list(self.messages)
         self.messages.append({"role": "user", "content": prompt})
-        for _ in range(MAX_TOOL_ROUNDS):
-            message = await self._request()
-            clean: dict[str, Any] = {
-                "role": "assistant",
-                "content": message.get("content"),
-            }
-            if message.get("tool_calls"):
-                clean["tool_calls"] = message["tool_calls"]
-            self.messages.append(clean)
-            calls = message.get("tool_calls") or []
-            if not calls:
-                return str(message.get("content") or "")
-            for call in calls:
-                function = call.get("function") or {}
-                try:
-                    args = json.loads(function.get("arguments") or "{}")
-                except json.JSONDecodeError as exc:
-                    result = f"error: invalid tool arguments: {exc}"
-                else:
-                    result = await self._run_tool(str(function.get("name") or ""), args)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id"),
-                        "content": result,
-                    }
-                )
-        raise RuntimeError(f"Model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
+        try:
+            for _ in range(MAX_TOOL_ROUNDS):
+                message = await self._request()
+                clean: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message.get("content"),
+                }
+                if message.get("tool_calls"):
+                    clean["tool_calls"] = message["tool_calls"]
+                self.messages.append(clean)
+                calls = message.get("tool_calls") or []
+                if not calls:
+                    return str(message.get("content") or "")
+                for call in calls:
+                    function = call.get("function") or {}
+                    try:
+                        args = json.loads(function.get("arguments") or "{}")
+                    except json.JSONDecodeError as exc:
+                        result = f"error: invalid tool arguments: {exc}"
+                    else:
+                        result = await self._run_tool(str(function.get("name") or ""), args)
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id"),
+                            "content": result,
+                        }
+                    )
+            raise RuntimeError(f"Model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
+        except BaseException:
+            # A cancelled or failed request must not poison the next turn with
+            # an unmatched user/tool message. Tool side effects remain in the
+            # audit log and are re-verified before any later action.
+            self.messages = checkpoint
+            raise
+
+    def compact(self, max_turns: int = 6) -> None:
+        """Keep complete recent user turns; never start history on a tool message."""
+        max_turns = max(1, int(max_turns))
+        user_starts = [
+            index for index, message in enumerate(self.messages)
+            if message.get("role") == "user"
+        ]
+        if len(user_starts) <= max_turns:
+            return
+        start = user_starts[-max_turns]
+        self.messages = self.messages[:1] + self.messages[start:]
 
     def clear(self) -> None:
         self.messages = self.messages[:1]

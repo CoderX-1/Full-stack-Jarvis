@@ -37,9 +37,11 @@ SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
 def _load_runner():
+    agent_root = Path(CFG["agent_dir"]).expanduser()
     candidates = [
-        Path(CFG["agent_dir"]).expanduser() / "fullstack-agent-main" / "agent.py",
-        Path(CFG["agent_dir"]).expanduser() / "fullstack-agent" / "agent.py",
+        agent_root / "core" / "agent.py",
+        agent_root / "fullstack-agent-main" / "agent.py",
+        agent_root / "fullstack-agent" / "agent.py",
         Path(__file__).resolve().parents[2] / "fullstack-agent-main" / "agent.py",
         Path(__file__).resolve().parents[2] / "fullstack-agent" / "agent.py",
         Path(__file__).resolve().parents[2] / "agent.py",
@@ -56,14 +58,14 @@ def _load_runner():
                 spec.loader.exec_module(module)
                 return module
     raise RuntimeError(
-        "Could not find fullstack-agent(-main)/agent.py beside backtalk."
+        "Could not find core/agent.py or fullstack-agent(-main)/agent.py."
     )
 
 
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None, resume_id: str | None = None):
         self.provider = str(CFG.get("provider") or os.getenv("AI_PROVIDER") or "openai").lower()
-        provider_default = "gemini-3.7-flash" if self.provider == "gemini" else "gpt-5.2"
+        provider_default = "gemini-3.7-flash" if self.provider == "gemini" else "gpt-5-mini"
         self.model = model or CFG.get("model") or os.getenv("AI_MODEL") or provider_default
         self._base_url = CFG.get("base_url") or os.getenv("AI_BASE_URL") or None
         self._can_use_tool = can_use_tool
@@ -139,8 +141,7 @@ class WarmBrain:
             self._agent.clear()
             return "Conversation cleared."
         if cmd == "/compact":
-            system = self._agent.messages[:1]
-            self._agent.messages = system + self._agent.messages[-12:]
+            self._agent.compact(6)
             return "Conversation compacted."
         if cmd.startswith("/model "):
             self.model = cmd.split(" ", 1)[1].strip()
