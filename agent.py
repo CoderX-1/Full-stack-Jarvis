@@ -273,6 +273,57 @@ class LocalAgent:
                     "For registered projects, prefer JARVIS Mark II project tools over raw shell "
                     "commands. Discover and inspect before registering, execute only registered "
                     "start/build commands, and report verification failures honestly. "
+                    "For Windows desktop requests, use the structured app, window, keyboard, mouse, "
+                    "media, and UI Automation tools instead of raw shell commands. Discover installed "
+                    "apps, known folders, files, or open windows first when a name/path is uncertain; "
+                    "read visible window text when the user asks what an app contains; prefer semantic UI controls "
+                    "over coordinates, and treat a reported verification failure as a real failure. "
+                    "Use send_keys only for shortcuts and named keys; always use type_text for literal words "
+                    "or sentences. If a typing or click tool reports unverified content, do not describe it "
+                    "as successful; inspect the current window and retry through a verified route. "
+                    "When accessibility cannot describe a visible interface, use local screen observation and "
+                    "visual grounding. Use find_visual_target/click_visual_target for role, position, color, shape, "
+                    "off-screen scroll search, and explicit template:name targets. Learn a local target template "
+                    "only when the user clearly asks JARVIS to remember that visual target. Inspect first; click "
+                    "only when the match is unique, and "
+                    "accept success only when the before/after visual verification confirms a state change. "
+                    "Natural descriptions such as an unlabeled settings gear may use the offline local Florence "
+                    "fallback only after OCR, accessibility, descriptors, templates, and enhanced OCR miss. A "
+                    "Florence-grounded click must always include an explicit expect_text, expect_absent_text, "
+                    "expect_window, or expected_state result; never use a model-generated box as unverified coordinate input. "
+                    "Whenever the user's requested outcome names text that should appear/disappear or a window "
+                    "that should open, pass that as an explicit click_visual_text/click_visual_target postcondition; do not reduce "
+                    "goal verification to generic pixel change. Use wait_for_visual_text for delayed UI states. "
+                    "A generic visual change or closed window proves only an observed UI response, not that the "
+                    "user's intended goal succeeded; reserve goal-success language for verified postconditions. "
+                    "Never guess, request, reveal, or audit passwords and other secrets. "
+                    "Plan multi-step desktop tasks from the user's desired end state, then inspect, act, "
+                    "and verify each step. Discover facts such as screen geometry through tools yourself. "
+                    "For duplicate window titles use exact hwnd:<handle>:pid:<pid> selectors from list_windows; "
+                    "choose the previously targeted window or uniquely minimized one when restoring. "
+                    "Use position_window fractions for any requested layout, including quarters and thirds. "
+                    "If a named UI control is missing, inspect_ui for its AutomationId, then use "
+                    "find_visual_text/click_visual_text or semantic visual-target tools if appropriate. "
+                    "For a target identified by visible text, use click_visual_text; for an icon or semantic "
+                    "description use click_visual_target. Never copy coordinates from visual find tools into "
+                    "mouse_action, because that "
+                    "bypasses stale-target and after-state verification. "
+                    "The UI State Graph is privacy-safe historical evidence, not current truth: consult it "
+                    "for repeated-work context when useful, but always re-observe the live window before "
+                    "input and never replay an action solely because an old transition succeeded. "
+                    "For stateful or multi-step interfaces, use inspect_ui_state to identify focus, active tabs, "
+                    "selection, toggles, modal blockers, modified state, progress, errors, and operation state. "
+                    "Express the intended after-state with expected_state on a visual click or verify_ui_state "
+                    "after another action. A state contract that was already true before an action is not proof "
+                    "that the action succeeded unless fresh evidence also shows the relevant transition. "
+                    "Operate as a closed loop: interpret, perceive, model, plan, guard, act once, verify, recover "
+                    "boundedly, and remember only privacy-safe evidence. Keep facts, inferences, and unknowns distinct. "
+                    "Do not ask whether to try an available alternative for an already requested action. "
+                    "Reobserve before retrying input "
+                    "that may have been delivered. Never repeat a partially completed side effect blindly. "
+                    "If a save dialog blocks closure, inspect it and apply the user's stated save/discard choice; "
+                    "ask only if that choice is missing. A failed recognition is not authorization to guess. "
+                    "Respect the user's latest requested response language throughout the conversation. "
                     "Ask only one setup question at a time. "
                     f"The selected runtime provider is {config.provider}, the model is {config.model}, "
                     f"and the non-secret API base URL is {config.base_url}; do not ask for these again.\n\n"
@@ -307,10 +358,16 @@ class LocalAgent:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"API request failed ({exc.code}): {detail[:2000]}") from exc
+            except TimeoutError as exc:
+                raise RuntimeError("API request timed out") from exc
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise RuntimeError("API returned an invalid JSON response") from exc
             except urllib.error.URLError as exc:
                 raise RuntimeError(f"Could not reach the API: {exc.reason}") from exc
 
         result = await asyncio.to_thread(send)
+        if not isinstance(result, dict):
+            raise RuntimeError("API returned a non-object response")
         if result.get("error"):
             raise RuntimeError(f"API error: {result['error']}")
         usage = result.get("usage") or {}
@@ -319,7 +376,12 @@ class LocalAgent:
         choices = result.get("choices") or []
         if not choices:
             raise RuntimeError("The API returned no choices")
-        return choices[0].get("message") or {}
+        if not isinstance(choices, list) or not isinstance(choices[0], dict):
+            raise RuntimeError("API returned invalid choices")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not (message.get("content") or message.get("tool_calls")):
+            raise RuntimeError("API returned an empty or invalid message")
+        return message
 
     async def _request(self) -> dict[str, Any]:
         async def request_with_transient_retries(config: ProviderConfig) -> dict[str, Any]:
@@ -463,6 +525,10 @@ class LocalAgent:
         self.compact(MAX_HISTORY_TURNS)
         checkpoint = list(self.messages)
         self.messages.append({"role": "user", "content": prompt})
+        recovery_pending = False
+        recovery_rounds = 0
+        failure_counts: dict[str, int] = {}
+        visual_observed = False
         try:
             for _ in range(MAX_TOOL_ROUNDS):
                 message = await self._request()
@@ -475,15 +541,45 @@ class LocalAgent:
                 self.messages.append(clean)
                 calls = message.get("tool_calls") or []
                 if not calls:
+                    if recovery_pending and recovery_rounds < 2:
+                        self.messages.pop()  # Do not speak a premature hand-off.
+                        self.messages.append({"role": "system", "content":
+                            "The requested desktop action has an unresolved tool failure. "
+                            "Inspect current state and try a different applicable tool within the original "
+                            "request before handing the task back. Do not repeat uncertain input or denied "
+                            "actions. If inspection establishes a missing user choice or unavailable "
+                            "capability, explain the specific blocker. Recovery budget is bounded."})
+                        recovery_pending = False
+                        recovery_rounds += 1
+                        continue
                     return str(message.get("content") or "")
                 for call in calls:
                     function = call.get("function") or {}
                     try:
                         args = json.loads(function.get("arguments") or "{}")
-                    except json.JSONDecodeError as exc:
+                        if not isinstance(args, dict):
+                            raise ValueError("tool arguments must be a JSON object")
+                    except (json.JSONDecodeError, ValueError) as exc:
                         result = f"error: invalid tool arguments: {exc}"
                     else:
-                        result = await self._run_tool(str(function.get("name") or ""), args)
+                        name = str(function.get("name") or "")
+                        signature = name + json.dumps(args, sort_keys=True)
+                        if (visual_observed and name == 'mouse_action'
+                                and args.get('action') in {'click', 'double_click'}):
+                            result = ('error: raw click after visual observation blocked; no input delivered. '
+                                      'Use click_visual_text or click_visual_target so the target is reacquired, '
+                                      'stabilized, and verified immediately before input.')
+                        elif failure_counts.get(signature, 0) >= 2:
+                            result = "error: repeated failed action blocked; inspect state or use a different approach"
+                        else:
+                            result = await self._run_tool(name, args)
+                        if result.lower().startswith('error:'):
+                            failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                        elif name in {'observe_screen', 'find_visual_text', 'find_visual_target', 'wait_for_visual_text'}:
+                            visual_observed = True
+                        if name in {'interact_ui', 'control_window', 'click_visual_text', 'click_visual_target', 'learn_visual_target', 'wait_for_visual_text', 'position_window',
+                                    'type_text', 'send_keys', 'launch_app', 'mouse_action'}:
+                            recovery_pending = result.lower().startswith('error:')
                     self.messages.append(
                         {
                             "role": "tool",

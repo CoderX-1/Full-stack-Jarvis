@@ -62,6 +62,18 @@ class StreamResponse(Response):
 
 
 class SpeechRouterTests(unittest.TestCase):
+    def test_stt_and_tts_circuits_use_independent_cooldowns(self):
+        router = load_router({"speech": {
+            "failure_cooldown_s": 90,
+            "stt_failure_cooldown_s": 120,
+            "tts_failure_cooldown_s": 3600,
+        }})
+        with patch.object(router.time, "monotonic", return_value=1000.0):
+            router._stt_circuit.trip()
+            router._tts_circuit.trip()
+        self.assertEqual(router._stt_circuit.retry_at, 1120.0)
+        self.assertEqual(router._tts_circuit.retry_at, 4600.0)
+
     def test_wav_encoding_is_mono_16_bit_at_requested_rate(self):
         router = load_router()
         encoded = router._wav_bytes(np.array([-2, 0, 2], dtype=np.int16), 16000)
@@ -76,7 +88,8 @@ class SpeechRouterTests(unittest.TestCase):
         router = load_router(cfg, {"GEMINI_API_KEY": "test-key"})
         body = {"steps": [{"content": [
             {"type": "text", "text": "Open WhatsApp, Jarvis."}]}]}
-        with patch.object(router.httpx, "post", return_value=Response(body)) as post:
+        with patch.object(router, "_key", return_value="test-key"), \
+                patch.object(router.httpx, "post", return_value=Response(body)) as post:
             text = router.try_gemini_transcribe(np.zeros(1600, np.int16))
         self.assertEqual(text, "Open WhatsApp, Jarvis.")
         request = post.call_args.kwargs
@@ -89,25 +102,14 @@ class SpeechRouterTests(unittest.TestCase):
 
     def test_transcription_failure_opens_circuit_and_uses_fallback(self):
         router = load_router(env={"GEMINI_API_KEY": "test-key"})
-        with patch.object(router.httpx, "post",
-                          side_effect=RuntimeError("offline")) as post:
+        with patch.object(router, "_key", return_value="test-key"), \
+                patch.object(router.httpx, "post",
+                             side_effect=RuntimeError("offline")) as post:
             self.assertIsNone(router.try_gemini_transcribe(
                 np.zeros(1600, np.int16)))
             self.assertIsNone(router.try_gemini_transcribe(
                 np.zeros(1600, np.int16)))
         self.assertEqual(post.call_count, 1)
-
-    def test_stt_and_tts_use_separate_cooldowns(self):
-        cfg = {"speech": {
-            "stt_failure_cooldown_s": 15,
-            "tts_failure_cooldown_s": 3600,
-        }}
-        router = load_router(cfg)
-        with patch.object(router.time, "monotonic", return_value=100):
-            router._stt_circuit.trip()
-            router._tts_circuit.trip()
-        self.assertEqual(router._stt_circuit.retry_at, 115)
-        self.assertEqual(router._tts_circuit.retry_at, 3700)
 
     def test_tts_stream_decodes_audio_delta(self):
         router = load_router(env={"GEMINI_API_KEY": "test-key"})
@@ -118,7 +120,8 @@ class SpeechRouterTests(unittest.TestCase):
         stream = StreamResponse(["event: step.delta",
                                  "data: " + __import__("json").dumps(event),
                                  "data: [DONE]"])
-        with patch.object(router.httpx, "stream", return_value=stream):
+        with patch.object(router, "_key", return_value="test-key"), \
+                patch.object(router.httpx, "stream", return_value=stream):
             chunks = list(router.stream_gemini_tts("Hello"))
         self.assertEqual(chunks[0][0], 24000)
         np.testing.assert_array_equal(
@@ -129,7 +132,8 @@ class SpeechRouterTests(unittest.TestCase):
         event = {"event_type": "error", "error": {
             "code": "quota_exceeded", "message": "retry later"}}
         stream = StreamResponse(["data: " + __import__("json").dumps(event)])
-        with patch.object(router.httpx, "stream", return_value=stream):
+        with patch.object(router, "_key", return_value="test-key"), \
+                patch.object(router.httpx, "stream", return_value=stream):
             with self.assertRaisesRegex(RuntimeError, "retry later"):
                 list(router.stream_gemini_tts("Hello"))
         self.assertFalse(router._tts_circuit.available())

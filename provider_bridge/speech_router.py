@@ -29,13 +29,15 @@ class _Circuit:
     def available(self) -> bool:
         return time.monotonic() >= self.retry_at
 
-    def trip(self) -> None:
+    def trip(self, quota: bool = False) -> None:
         try:
             speech = _speech()
             delay = max(10.0, float(speech.get(
                 f"{self.kind}_failure_cooldown_s",
                 speech.get("failure_cooldown_s", 90),
             )))
+            if quota:
+                delay = max(delay, float(speech.get(f"{self.kind}_quota_cooldown_s", 900)))
         except (TypeError, ValueError):
             delay = 90.0
         self.retry_at = time.monotonic() + delay
@@ -138,7 +140,8 @@ def try_gemini_transcribe(pcm: np.ndarray, rate: int = 16000) -> str | None:
         _stt_circuit.reset()
         return text
     except Exception as exc:
-        _stt_circuit.trip()
+        response = getattr(exc, 'response', None)
+        _stt_circuit.trip(quota=getattr(response, 'status_code', None) == 429)
         log(f"[ears] Gemini transcription unavailable ({str(exc)[:100]}) -- "
             "using local Whisper")
         return None
@@ -167,11 +170,20 @@ def stream_gemini_tts(text: str):
         "stream": True,
     }
     got_audio = False
+    pending = b""
     try:
+        timeout_seconds = _timeout("tts", 45.0)
+        deadline = time.monotonic() + timeout_seconds
         with httpx.stream("POST", _URL, headers=_headers(stream=True),
-                          json=payload, timeout=_timeout("tts", 45.0)) as response:
+                          json=payload, timeout=timeout_seconds) as response:
             response.raise_for_status()
             for line in response.iter_lines():
+                # A streaming server can keep a socket alive indefinitely
+                # with non-audio events, continually resetting the library's
+                # per-read timeout. Enforce a total request deadline so local
+                # speech fallback cannot be starved at startup.
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Gemini TTS exceeded its total response deadline")
                 if not line.startswith("data: "):
                     continue
                 body = line[6:]
@@ -184,13 +196,16 @@ def stream_gemini_tts(text: str):
                 delta = event.get("delta") or {}
                 if delta.get("type") != "audio" or not delta.get("data"):
                     continue
-                raw = base64.b64decode(delta["data"])
-                raw = raw[:len(raw) - len(raw) % 2]
+                raw = pending + base64.b64decode(delta["data"], validate=True)
+                aligned = len(raw) - len(raw) % 2
+                pending, raw = raw[aligned:], raw[:aligned]
                 if raw:
                     got_audio = True
                     _tts_circuit.reset()
                     yield int(delta.get("sample_rate") or 24000), \
                         np.frombuffer(raw, dtype="<i2").copy()
+        if pending:
+            raise RuntimeError("Gemini returned incomplete PCM audio")
         if not got_audio:
             raise RuntimeError("Gemini returned no speech audio")
     except GeneratorExit:

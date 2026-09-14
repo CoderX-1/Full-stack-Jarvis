@@ -102,6 +102,8 @@ def patch(target: Path) -> None:
         + '        "stt_timeout_s": 30,\n'
         + '        "tts_timeout_s": 45,\n'
         + '        "failure_cooldown_s": 90,\n'
+        + '        "stt_failure_cooldown_s": 120,\n'
+        + '        "tts_failure_cooldown_s": 3600,\n'
         + '        "tts_style": "calm, polished, intelligent assistant delivery",\n'
         + '        "urdu_fallback_model": "facebook/mms-tts-urd-script_arabic",\n'
         + '    },\n'

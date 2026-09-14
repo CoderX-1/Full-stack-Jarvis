@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from windows_control import WindowsControl
+from windows_vision import WindowsVision
+
 
 SKIP_DIRS = {
     ".git",
@@ -36,6 +39,37 @@ READ_ONLY_MARK2_TOOLS = {
     "search_project_files",
     "check_local_url",
     "recent_audit",
+    "list_installed_apps",
+    "list_windows",
+    "inspect_ui",
+    "read_window_text",
+    "list_known_folders",
+    "find_files",
+    "vision_status",
+    "ui_state_graph_status",
+    "recent_ui_transitions",
+    "inspect_ui_state",
+    "verify_ui_state",
+    "observe_screen",
+    "find_visual_text",
+    "find_visual_target",
+    "wait_for_visual_text",
+}
+
+UI_STATE_CONTRACT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "window": {"type": "string"},
+        "operation": {"type": "string", "enum": ["idle", "busy", "blocked", "error"]},
+        "modified": {"type": "boolean"},
+        "modal": {"oneOf": [{"type": "boolean"}, {"type": "string", "enum": ["present", "absent"]}]},
+        "active_tab": {"type": "string"},
+        "focused": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "role": {"type": "string"}}}]},
+        "control": {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "present": {"type": "boolean"}, "enabled": {"type": "boolean"}, "focused": {"type": "boolean"}, "selected": {"type": "boolean"}, "toggle_state": {"type": "string"}, "expand_state": {"type": "string"}}},
+        "progress_at_least": {"type": "number", "minimum": 0, "maximum": 100},
+    },
+    "minProperties": 1,
 }
 
 MARK2_TOOLS = [
@@ -198,6 +232,427 @@ MARK2_TOOLS = [
         },
     },
 ]
+MARK2_TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "position_window",
+            "description": "Place any window in a region of its own monitor work area, automatically detecting screen size. Coordinates are fractions 0..1: top-right quarter is x=.5,y=0,width=.5,height=.5. Use exact selector from list_windows for duplicate titles. Verifies resulting geometry.",
+            "parameters": {"type": "object", "properties": {
+                "window": {"type": "string"},
+                "x": {"type": "number", "minimum": 0, "maximum": 1},
+                "y": {"type": "number", "minimum": 0, "maximum": 1},
+                "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+            }, "required": ["window", "x", "y", "width", "height"]}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_status",
+            "description": "Report whether the local, offline Vision-Control Engine is ready and which privacy protections are active.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_state_graph_status",
+            "description": "Report privacy-safe UI State Graph health, bounded state/transition counts, and persistence status. The graph is observational evidence and never grants permission or blindly replays actions.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recent_ui_transitions",
+            "description": "Read recent privacy-safe UI transitions. Labels, OCR text, screenshots, and window titles are not stored; use this only as historical evidence and re-observe before acting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_ui_state",
+            "description": "Build a fresh structured world-state for one window: control hierarchy, focus, active tabs, selection/toggle/expand state, modal, modified, progress, error, and operation state. Read-only; labels are live and are not persisted in the graph or audit log.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string", "description": "Unique title or process; empty means foreground"},
+                    "language": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_ui_state",
+            "description": "Read-only verification of a machine-checkable expected UI state against a fresh observation. Does not click or type. Use after an action when completion depends on focus, selected tab/control state, modal state, operation state, modified state, progress, or resulting window.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "language": {"type": "string"},
+                    "expected": UI_STATE_CONTRACT_SCHEMA,
+                },
+                "required": ["window", "expected"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "observe_screen",
+            "description": "Capture one exact visible app window, redact password fields, run offline Windows OCR, and return recognized text with window-relative boxes. Use when UI Automation cannot describe the screen.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string", "description": "Unique title or process; empty means the foreground window"},
+                    "language": {"type": "string", "description": "OCR language such as en"},
+                    "max_words": {"type": "integer", "minimum": 1, "maximum": 300},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_visual_text",
+            "description": "Find visible text in an app screenshot with fuzzy OCR matching. If OCR misses a named control, use its current UI Automation bounds as a one-shot fallback. Return precise boxes without clicking.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "text": {"type": "string"},
+                    "language": {"type": "string"},
+                },
+                "required": ["window", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wait_for_visual_text",
+            "description": "Wait without input until visible text becomes present or absent. Uses repeated local OCR/UIA observations and requires two observations before claiming absence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "text": {"type": "string"},
+                    "condition": {"type": "string", "enum": ["present", "absent"]},
+                    "timeout_seconds": {"type": "number", "minimum": 0.2, "maximum": 10},
+                    "language": {"type": "string"},
+                },
+                "required": ["window", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_visual_target",
+            "description": "Find a visible target using confidence-fused OCR, enriched accessibility metadata, role/position/color/shape descriptions, an explicit learned template, or the offline local Florence semantic fallback. Returns boxes without input.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "target": {"type": "string", "description": "Visible label, natural semantic description such as settings gear, role/position/color/shape description, or template:name"},
+                    "language": {"type": "string"},
+                },
+                "required": ["window", "target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "learn_visual_target",
+            "description": "Explicitly learn a small password-redacted local image template from a currently identifiable visible target. Use when an icon must later be recognized by appearance. This writes only the selected redacted crop under JARVIS state.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "name": {"type": "string"},
+                    "source": {"type": "string", "description": "Current visible text or semantic target description used to select the crop"},
+                    "occurrence": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "language": {"type": "string"},
+                },
+                "required": ["window", "name", "source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click_visual_target",
+            "description": "Find and safely click text, a semantic visual target, or template:name. Uses offline Florence only after deterministic methods miss; Florence targets require an explicit expect_* or expected_state postcondition. Performs bounded guarded scrolling, stabilizes moving targets, refuses ambiguity, and verifies results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "target": {"type": "string"},
+                    "occurrence": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "language": {"type": "string"},
+                    "max_scrolls": {"type": "integer", "minimum": 0, "maximum": 12},
+                    "direction": {"type": "string", "enum": ["up", "down"]},
+                    "expect_text": {"type": "string"},
+                    "expect_absent_text": {"type": "string"},
+                    "expect_window": {"type": "string"},
+                    "expected_state": UI_STATE_CONTRACT_SCHEMA,
+                    "timeout_seconds": {"type": "number", "minimum": 0.2, "maximum": 5},
+                },
+                "required": ["window", "target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click_visual_text",
+            "description": "Visually locate text, re-observe and re-locate it immediately before clicking, then poll and verify the result with screenshots, OCR, structured UI state, window identity, and optional explicit postconditions. Refuses ambiguous, changed, stale, or occluded targets. Supply expect_* for resulting text/window or expected_state for focus, tab, control, modal, modified, progress, or operation outcomes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "text": {"type": "string"},
+                    "occurrence": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "language": {"type": "string"},
+                    "expect_text": {"type": "string", "description": "Text that must be visible after the action"},
+                    "expect_absent_text": {"type": "string", "description": "Text present before the action that must disappear and remain absent across two observations"},
+                    "expect_window": {"type": "string", "description": "Expected foreground window title or process after the action"},
+                    "expected_state": UI_STATE_CONTRACT_SCHEMA,
+                    "timeout_seconds": {"type": "number", "minimum": 0.2, "maximum": 5},
+                },
+                "required": ["window", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_diagnostic_snapshot",
+            "description": "Explicitly save the latest password-redacted window screenshot under .jarvis/vision for debugging. Normal observations remain memory-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "language": {"type": "string"},
+                },
+                "required": ["window"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_known_folders",
+            "description": "Resolve the current Windows user's real Home, Desktop, Documents, Downloads, Pictures, Music, and Videos folders without guessing the username.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files or folders by partial name under a Windows known folder or an exact directory. Use this instead of guessing paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "location": {"type": "string", "description": "home, desktop, documents, downloads, pictures, music, videos, or an exact path"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_installed_apps",
+            "description": "Discover Windows Start-menu apps dynamically. Use this before launch_app when the spoken app name may be uncertain.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_windows",
+            "description": "List visible Windows application windows, including foreground, process, PID, and minimized state.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "launch_app",
+            "description": "Open any uniquely matched installed Windows app and verify that an application window appeared. If uncertain, call list_installed_apps first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_item",
+            "description": "Open an existing file/folder, web URL, mail link, or Windows Settings page in its registered app.",
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "control_window",
+            "description": "Reliably focus, minimize, maximize, restore, close, or snap a visible app window. Close is graceful and never force-kills unsaved work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string", "description": "Unique title/process or exact hwnd:<handle>:pid:<pid> selector from list_windows"},
+                    "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "restore", "close", "snap_left", "snap_right"]},
+                },
+                "required": ["window", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_keys",
+            "description": "Send only keyboard shortcuts or named keys to a verified target window, such as ctrl+l, ctrl+s, or enter. Never pass literal words or sentences; use type_text for literal text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keys": {"type": "string"},
+                    "window": {"type": "string"},
+                    "interval_ms": {"type": "integer", "minimum": 0, "maximum": 1000},
+                },
+                "required": ["keys"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "type_text",
+            "description": "Type supplied English/Roman-Urdu literal text into an exact target window, then verify foreground process and focused-control content without exposing the text in the audit log.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "window": {"type": "string"},
+                    "interval_ms": {"type": "integer", "minimum": 0, "maximum": 250},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mouse_action",
+            "description": "Move, click, double-click, or scroll the mouse anywhere on the Windows virtual desktop and verify cursor/foreground state. Prefer semantic interact_ui when possible.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["move", "click", "double_click", "scroll"]},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "amount": {"type": "integer", "minimum": -100, "maximum": 100},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "media_control",
+            "description": "Control Windows volume and media playback globally.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["volume_up", "volume_down", "mute", "play_pause", "next", "previous", "stop"]},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 50},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_ui",
+            "description": "Inspect named buttons, fields, menus, tabs, and other controls inside an open Windows app using native UI Automation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["window"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_window_text",
+            "description": "Read visible document/value text from an open Windows app through UI Automation. Password fields are always skipped.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000},
+                },
+                "required": ["window"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "interact_ui",
+            "description": "Operate a named Windows UI control semantically (button, text field, checkbox, list item, or expandable control) and verify the invoked control.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "string"},
+                    "control": {"type": "string", "description": "Visible control name or AutomationId returned by inspect_ui"},
+                    "action": {"type": "string", "enum": ["click", "focus", "set_text", "toggle", "select", "expand", "collapse"]},
+                    "value": {"type": "string"},
+                },
+                "required": ["window", "control", "action"],
+            },
+        },
+    },
+])
 MARK2_TOOL_NAMES = {item["function"]["name"] for item in MARK2_TOOLS}
 
 
@@ -212,6 +667,8 @@ class Mark2Runtime:
         self.audit_path = self.state_dir / "audit.jsonl"
         self._live_processes: dict[str, subprocess.Popen[str]] = {}
         self._process_uses_shell: dict[str, bool] = {}
+        self.windows_control = WindowsControl(self.agent_home)
+        self.windows_vision = WindowsVision(self.windows_control, self.state_dir)
 
     def _ensure_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -252,12 +709,28 @@ class Mark2Runtime:
     def audit(self, tool: str, args: dict[str, Any], result: str) -> None:
         self._ensure_state()
         safe_args = self._sanitize_for_audit(args)
+        if tool == "verify_ui_state" and isinstance(safe_args, dict) and "expected" in safe_args:
+            safe_args["expected"] = "[REDACTED: state contract]"
+        if tool in {"click_visual_text", "click_visual_target"} and isinstance(safe_args, dict) and "expected_state" in safe_args:
+            safe_args["expected_state"] = "[REDACTED: state contract]"
+        if tool in {"find_visual_target", "learn_visual_target", "click_visual_target"} and isinstance(safe_args, dict):
+            for key in ("target", "source", "name"):
+                if key in safe_args:
+                    safe_args[key] = "[REDACTED]"
+        if tool == "send_keys" and isinstance(safe_args, dict) and "keys" in safe_args:
+            # Rejected legacy/model calls may put literal user text in this
+            # shortcut field. Never retain that text in the audit trail.
+            safe_args["keys"] = "[REDACTED]"
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": tool,
             "args": safe_args,
             "success": not result.lower().startswith(("error:", "denied")),
-            "result": result[:1000],
+            "result": (
+                "[REDACTED: visible window text]"
+                if tool in {"read_window_text", "observe_screen", "find_visual_text", "find_visual_target", "learn_visual_target", "wait_for_visual_text", "click_visual_text", "click_visual_target", "interact_ui", "inspect_ui_state", "verify_ui_state"}
+                else result[:1000]
+            ),
         }
         with self.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -268,7 +741,7 @@ class Mark2Runtime:
             safe = {}
             for key, item in value.items():
                 normalized = str(key).casefold()
-                if normalized in {"content", "new", "old"} or any(
+                if normalized in {"content", "new", "old", "text", "value"} or normalized.endswith("_text") or any(
                     marker in normalized
                     for marker in ("api_key", "apikey", "password", "secret", "token")
                 ):
@@ -456,17 +929,16 @@ class Mark2Runtime:
             )
         self._live_processes[project["name"]] = process
         self._process_uses_shell[project["name"]] = uses_shell
+        process_state = self._load_json(self.process_path, {"processes": {}})
+        records = process_state.setdefault("processes", {})
+        records[project["name"]] = {
+            "pid": process.pid,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "log": str(log_path).replace("\\", "/"),
+        }
         self._save_json(
             self.process_path,
-            {
-                "processes": {
-                    project["name"]: {
-                        "pid": process.pid,
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "log": str(log_path).replace("\\", "/"),
-                    }
-                }
-            },
+            process_state,
         )
         url = project.get("url") or ""
         deadline = time.monotonic() + max(1, min(verify_timeout, 60))
@@ -505,6 +977,9 @@ class Mark2Runtime:
             return f"error: stop command ran, but PID {process.pid} is still active"
         self._live_processes.pop(project["name"], None)
         self._process_uses_shell.pop(project["name"], None)
+        process_state = self._load_json(self.process_path, {"processes": {}})
+        process_state.get("processes", {}).pop(project["name"], None)
+        self._save_json(self.process_path, process_state)
         return f"Stopped project {name}; verified PID {process.pid} is no longer active"
 
     def project_status(self, name: str) -> str:
@@ -628,6 +1103,106 @@ class Mark2Runtime:
                 int(args.get("timeout") or 600),
             ),
             "recent_audit": lambda: self.recent_audit(int(args.get("limit") or 20)),
+            "list_installed_apps": lambda: self.windows_control.list_installed_apps(
+                str(args.get("search") or ""), int(args.get("limit") or 50)
+            ),
+            "list_windows": lambda: self.windows_control.list_windows(),
+            "list_known_folders": lambda: self.windows_control.list_known_folders(),
+            "find_files": lambda: self.windows_control.find_files(
+                str(args["query"]), str(args.get("location") or "home"),
+                int(args.get("limit") or 50),
+            ),
+            "vision_status": lambda: self.windows_vision.status(),
+            "ui_state_graph_status": lambda: self.windows_vision.state_graph.status(),
+            "recent_ui_transitions": lambda: self.windows_vision.state_graph.recent(
+                int(args.get("limit") or 10)
+            ),
+            "inspect_ui_state": lambda: self.windows_vision.inspect_ui_state(
+                str(args.get("window") or ""), str(args.get("language") or "en")
+            ),
+            "verify_ui_state": lambda: self.windows_vision.verify_ui_state(
+                str(args["window"]), dict(args.get("expected") or {}),
+                str(args.get("language") or "en"),
+            ),
+            "observe_screen": lambda: self.windows_vision.observe_screen(
+                str(args.get("window") or ""), str(args.get("language") or "en"),
+                int(args.get("max_words") or 120),
+            ),
+            "find_visual_text": lambda: self.windows_vision.find_visual_text(
+                str(args["window"]), str(args["text"]), str(args.get("language") or "en")
+            ),
+            "find_visual_target": lambda: self.windows_vision.find_visual_target(
+                str(args["window"]), str(args["target"]), str(args.get("language") or "en")
+            ),
+            "learn_visual_target": lambda: self.windows_vision.learn_visual_target(
+                str(args["window"]), str(args["name"]), str(args["source"]),
+                int(args.get("occurrence") or 0), str(args.get("language") or "en"),
+            ),
+            "wait_for_visual_text": lambda: self.windows_vision.wait_for_visual_text(
+                str(args["window"]), str(args["text"]), str(args.get("condition") or "present"),
+                float(args.get("timeout_seconds") or 5.0), str(args.get("language") or "en"),
+            ),
+            "click_visual_text": lambda: self.windows_vision.click_visual_text(
+                str(args["window"]), str(args["text"]), int(args.get("occurrence") or 0),
+                str(args.get("button") or "left"), str(args.get("language") or "en"),
+                expect_text=str(args.get("expect_text") or ""),
+                expect_absent_text=str(args.get("expect_absent_text") or ""),
+                expect_window=str(args.get("expect_window") or ""),
+                timeout_seconds=float(args.get("timeout_seconds") or 2.0),
+                expected_state=dict(args.get("expected_state") or {}),
+            ),
+            "click_visual_target": lambda: self.windows_vision.click_visual_target(
+                str(args["window"]), str(args["target"]), int(args.get("occurrence") or 0),
+                str(args.get("button") or "left"), str(args.get("language") or "en"),
+                max_scrolls=int(args.get("max_scrolls") or 0),
+                direction=str(args.get("direction") or "down"),
+                expect_text=str(args.get("expect_text") or ""),
+                expect_absent_text=str(args.get("expect_absent_text") or ""),
+                expect_window=str(args.get("expect_window") or ""),
+                timeout_seconds=float(args.get("timeout_seconds") or 2.0),
+                expected_state=dict(args.get("expected_state") or {}),
+            ),
+            "save_diagnostic_snapshot": lambda: self.windows_vision.save_diagnostic_snapshot(
+                str(args["window"]), str(args.get("language") or "en")
+            ),
+            "launch_app": lambda: self.windows_control.launch_app(
+                str(args["name"]), int(args.get("wait_seconds") or 8)
+            ),
+            "open_item": lambda: self.windows_control.open_item(str(args["target"])),
+            "control_window": lambda: self.windows_control.control_window(
+                str(args["window"]), str(args["action"])
+            ),
+            "position_window": lambda: self.windows_control.position_window(
+                str(args['window']), float(args['x']), float(args['y']),
+                float(args['width']), float(args['height']),
+            ),
+            "send_keys": lambda: self.windows_control.send_keys(
+                str(args["keys"]), str(args.get("window") or ""),
+                int(args.get("interval_ms") if args.get("interval_ms") is not None else 40),
+            ),
+            "type_text": lambda: self.windows_control.type_text(
+                str(args["text"]), str(args.get("window") or ""),
+                int(args.get("interval_ms") if args.get("interval_ms") is not None else 5),
+            ),
+            "mouse_action": lambda: self.windows_control.mouse_action(
+                str(args["action"]),
+                int(args["x"]) if args.get("x") is not None else None,
+                int(args["y"]) if args.get("y") is not None else None,
+                str(args.get("button") or "left"), int(args.get("amount") or 3),
+            ),
+            "media_control": lambda: self.windows_control.media_control(
+                str(args["action"]), int(args.get("steps") or 1)
+            ),
+            "inspect_ui": lambda: self.windows_control.inspect_ui(
+                str(args["window"]), int(args.get("limit") or 80)
+            ),
+            "read_window_text": lambda: self.windows_control.read_window_text(
+                str(args["window"]), int(args.get("max_chars") or 20_000)
+            ),
+            "interact_ui": lambda: self.windows_control.interact_ui(
+                str(args["window"]), str(args["control"]), str(args["action"]),
+                str(args.get("value") or ""),
+            ),
         }
         if name not in routes:
             return f"error: unknown Mark II tool {name}"
