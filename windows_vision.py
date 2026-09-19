@@ -21,6 +21,7 @@ from typing import Any
 from ctypes import wintypes
 
 from florence_client import FlorenceClient
+from selector_engine import SelectorEngine
 from ui_state_graph import UIStateGraph
 from windows_control import IS_WINDOWS, WindowsControl, _norm
 
@@ -97,6 +98,7 @@ class WindowsVision:
         self.control = control
         self.state_dir = state_dir
         self.state_graph = UIStateGraph(state_dir / "ui-state-graph.json")
+        self.selector_engine = SelectorEngine(state_dir / "selector-memory.json")
         self.template_dir = state_dir / "vision-targets"
         self.florence = FlorenceClient()
 
@@ -125,6 +127,7 @@ class WindowsVision:
                 f"ocr=Windows.Media.Ocr ({version}) | displays={screens or 1} | "
                 "targeting=primary-OCR+enriched-UIA+semantic-role-position-color-grounding+"
                 "adaptive-local-OCR+learned-local-templates+Florence-semantic-fallback+bounded-scroll-search | "
+                "selectors=ranked-evidence+stable-identity+context-anchor+fresh-repair+decaying-private-memory | "
                 f"vlm={vlm_status} | "
                 "verification=motion-stability+two-pass-target+guarded-input+foreground+geometry+occlusion+"
                 "polled-postconditions+OCR+UIA+target-local-diff | "
@@ -322,6 +325,7 @@ $out | ConvertTo-Json -Compress
                     bottom = max(word.y + word.height for word in group)
                     candidates.append({
                         "text": combined, "score": round(score, 3), "line": line_number,
+                        "source": "ocr", "role": "text",
                         "x": left, "y": top, "width": right - left, "height": bottom - top,
                         "screen_x": observation.origin_x + (left + right) // 2,
                         "screen_y": observation.origin_y + (top + bottom) // 2,
@@ -454,6 +458,20 @@ $out | ConvertTo-Json -Compress
             ]
             labels = {_norm(value) for value in metadata if value and _norm(value)}
             role = _norm(str(item.get("type") or "").replace("ControlType.", ""))
+            class_role = _norm(str(item.get("class") or ""))
+            # Some native/framework bridges (notably WinForms) expose real
+            # buttons as ControlType.Pane. Recover the semantic role from the
+            # native class without weakening identity or geometry checks.
+            if role in {"", "pane", "custom"}:
+                inferred = next((
+                    canonical for marker, canonical in (
+                        ("button", "button"), ("edit", "edit"),
+                        ("checkbox", "checkbox"), ("radiobutton", "radiobutton"),
+                        ("combobox", "combobox"), ("listbox", "list"),
+                    ) if marker in class_role
+                ), "")
+                if inferred:
+                    role = inferred
             if parts["roles"] and not any(required in role for required in parts["roles"]):
                 continue
             exact = bool(forms & labels)
@@ -525,6 +543,10 @@ $out | ConvertTo-Json -Compress
             matches.append({
                 "text": name or automation_id or str(item.get("help") or "") or f"unnamed {role or 'control'}",
                 "automation_id": automation_id, "role": role, "color": color,
+                "runtime_id": str(item.get("runtime_id") or ""),
+                "parent_runtime_id": str(item.get("parent_runtime_id") or ""),
+                "access_key": str(item.get("access_key") or ""),
+                "class": str(item.get("class") or ""),
                 "source": source, "score": round(score, 3), "line": 0,
                 "x": max(0, left), "y": max(0, top),
                 "width": min(observation.width, right) - max(0, left),
@@ -682,35 +704,72 @@ $out | ConvertTo-Json -Compress
         except Exception:
             return []
 
+    def _app_version_fingerprint(self, observation: VisionObservation) -> str:
+        """Hash executable metadata without persisting its path."""
+        try:
+            resolver = getattr(self.control, "_process_path", None)
+            path = resolver(observation.pid) if callable(resolver) and observation.pid else ""
+            stat = os.stat(path) if path else None
+            payload = f"{observation.process}|{stat.st_size}|{stat.st_mtime_ns}" if stat else observation.process
+        except (OSError, RuntimeError, TypeError, ValueError):
+            payload = observation.process
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:20]
+
+    def _rank_selector_candidates(
+        self, observation: VisionObservation, query: str,
+        candidates: list[dict[str, Any]], elements: list[dict[str, Any]], *,
+        role: str = "", anchor: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.selector_engine.rank(
+            candidates,
+            process=observation.process,
+            version_fingerprint=self._app_version_fingerprint(observation),
+            query=query,
+            role=role,
+            anchor=anchor,
+            elements=elements,
+        )
+
     def _locate_details(
         self, observation: VisionObservation, query: str, language: str = "en", *,
-        allow_vlm: bool = True,
+        allow_vlm: bool = True, role: str = "", anchor: str = "",
     ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         if query.casefold().strip().startswith("template:"):
             matches = self._template_matches(observation, query.split(":", 1)[1].strip())
-            return matches, "local-template" if matches else "none", []
-        matches = self.locate(observation, query)
-        if matches:
-            return matches, "ocr", []
+            ranked = self._rank_selector_candidates(
+                observation, query, matches, [], role=role, anchor=anchor,
+            )
+            return ranked, "local-template" if ranked else "none", []
+        candidates = self.locate(observation, query)
+        # A unique exact OCR label is already a complete low-latency selector.
+        # UIA remains the fresh-observation repair path if that label later
+        # disappears, and is collected immediately when role/anchor context or
+        # ambiguity requires evidence fusion.
+        if (
+            len(candidates) == 1
+            and float(candidates[0].get("score") or 0.0) >= 0.995
+            and not role and not anchor
+        ):
+            ranked = self._rank_selector_candidates(
+                observation, query, candidates, [], role=role, anchor=anchor,
+            )
+            return ranked, "ocr", []
         elements: list[dict[str, Any]] = []
         try:
             elements = self.control.ui_elements(observation.handle)
-            matches = self._semantic_matches(observation, query, elements)
+            candidates.extend(self._semantic_matches(observation, query, elements))
         except (AttributeError, RuntimeError, json.JSONDecodeError, TypeError, ValueError):
-            matches = []
-        if matches:
-            sources = {str(item.get("source") or "uia-fallback") for item in matches}
-            return matches, sources.pop() if len(sources) == 1 else "confidence-fusion", elements
-        pixel_matches = self._visual_descriptor_matches(observation, query)
-        if pixel_matches:
-            return pixel_matches, "local-pixel-grounding", elements
-        enhanced = self._enhanced_ocr_matches(observation, query, language)
-        if enhanced:
-            return enhanced, "ocr-enhanced", elements
-        if not allow_vlm:
-            return [], "none", elements
-        vlm_matches = self._florence_matches(observation, query, elements)
-        return vlm_matches, "local-vlm" if vlm_matches else "none", elements
+            pass
+        candidates.extend(self._visual_descriptor_matches(observation, query))
+        if not candidates:
+            candidates.extend(self._enhanced_ocr_matches(observation, query, language))
+        if not candidates and allow_vlm:
+            candidates.extend(self._florence_matches(observation, query, elements))
+        ranked = self._rank_selector_candidates(
+            observation, query, candidates, elements, role=role, anchor=anchor,
+        )
+        source = str(ranked[0].get("source") or "none") if ranked else "none"
+        return ranked, source, elements
 
     def _florence_matches(
         self, observation: VisionObservation, query: str,
@@ -946,7 +1005,10 @@ $out | ConvertTo-Json -Compress
                 image=observation.image, redacted_password_fields=observation.redacted_password_fields,
                 ocr_scale=scale, pid=observation.pid, process=observation.process,
             )
-            return self.locate(retry, query)
+            matches = self.locate(retry, query)
+            for item in matches:
+                item["source"] = "ocr-enhanced"
+            return matches
         except Exception:
             # This is a best-effort local fallback after primary OCR and UIA
             # already missed. Its failure must not invent a target or weaken
@@ -1002,6 +1064,13 @@ $out | ConvertTo-Json -Compress
             )
         except Exception:
             return "unavailable"
+
+    def _record_selector_result(self, target: dict[str, Any], verified: bool) -> None:
+        """Best-effort strategy learning; never change an action's truth value."""
+        try:
+            self.selector_engine.record_result(target, verified)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
 
     def inspect_ui_state(self, window: str = "", language: str = "en") -> str:
         """Return a fresh structured UI world-state without delivering input."""
@@ -1068,10 +1137,15 @@ $out | ConvertTo-Json -Compress
             for index, item in enumerate(matches[:20], start=1)
         )
 
-    def find_visual_target(self, window: str, target: str, language: str = "en") -> str:
+    def find_visual_target(
+        self, window: str, target: str, language: str = "en", *,
+        role: str = "", anchor: str = "",
+    ) -> str:
         """Find text, semantic UI descriptions, or an explicit learned template."""
         observation = self.observe(window, language)
-        matches, source, elements = self._locate_details(observation, target, language)
+        matches, source, elements = self._locate_details(
+            observation, target, language, role=role, anchor=anchor,
+        )
         state_id = self._record_observation(observation, elements)
         if not matches:
             if target.casefold().strip().startswith("template:"):
@@ -1080,7 +1154,8 @@ $out | ConvertTo-Json -Compress
                     return f"No learned local template named {name!r}; state_id={state_id}."
             return f"No visual target matched {target!r} in {observation.title!r}; state_id={state_id}."
         return f"Observed state_id={state_id}.\n" + "\n".join(
-            f"{index}. {item['text']!r} score={item['score']} source={source} "
+            f"{index}. {item['text']!r} score={item['score']} source={item.get('source') or source} "
+            f"selector={item.get('selector_strategy') or 'unranked'} selector_score={item.get('selector_score', item['score'])} "
             f"role={item.get('role') or 'visual'} color={item.get('color') or 'unspecified'} "
             f"window_box=({item['x']},{item['y']},{item['width']},{item['height']}) "
             f"screen_center=({item['screen_x']},{item['screen_y']})"
@@ -1094,6 +1169,7 @@ $out | ConvertTo-Json -Compress
         expect_text: str = "", expect_absent_text: str = "",
         expect_window: str = "", timeout_seconds: float = 2.0,
         expected_state: dict[str, Any] | None = None,
+        role: str = "", anchor: str = "",
     ) -> str:
         """Boundedly scroll for a grounded target, then use the verified click pipeline."""
         scroll_limit = max(0, min(int(max_scrolls), 12))
@@ -1107,14 +1183,21 @@ $out | ConvertTo-Json -Compress
         seen_hashes: set[str] = set()
         for scroll_count in range(scroll_limit + 1):
             observation = self.observe(window, language)
-            matches, _source, _elements = self._locate_details(observation, target, language)
+            matches, _source, _elements = self._locate_details(
+                observation, target, language, role=role, anchor=anchor,
+            )
             if matches:
                 result = self.click_visual_text(
                     window, target, occurrence, button, language,
                     expect_text=expect_text, expect_absent_text=expect_absent_text,
                     expect_window=expect_window, timeout_seconds=timeout_seconds,
                     expected_state=expected_state,
+                    role=role, anchor=anchor,
                 )
+                if result.casefold().startswith("error:"):
+                    return f"error: scroll_search={scroll_count}; {result[6:].lstrip()}"
+                if result.casefold().startswith("denied"):
+                    return f"denied: scroll_search={scroll_count}; {result}"
                 return f"scroll_search={scroll_count}; {result}"
             if observation.image_hash in seen_hashes:
                 return (
@@ -1308,6 +1391,7 @@ $out | ConvertTo-Json -Compress
         expect_text: str = "", expect_absent_text: str = "",
         expect_window: str = "", timeout_seconds: float = 2.0,
         expected_state: dict[str, Any] | None = None,
+        role: str = "", anchor: str = "",
     ) -> str:
         if not _norm(text):
             return "error: visual target must include at least one letter or number; no click was delivered"
@@ -1315,6 +1399,8 @@ $out | ConvertTo-Json -Compress
             ("expect_text", expect_text),
             ("expect_absent_text", expect_absent_text),
             ("expect_window", expect_window),
+            ("role", role),
+            ("anchor", anchor),
         ):
             if value and not _norm(value):
                 return f"error: {label} must include at least one letter or number; no click was delivered"
@@ -1326,7 +1412,9 @@ $out | ConvertTo-Json -Compress
         if contract_validation.get("error"):
             return f"error: {contract_validation['error']}; no click was delivered"
         initial = self.observe(window, language)
-        matches, source, before_elements = self._locate_details(initial, text, language)
+        matches, source, before_elements = self._locate_details(
+            initial, text, language, role=role, anchor=anchor,
+        )
         if not matches:
             return f"error: no visual text matched {text!r} in {initial.title!r}"
         if source == "local-vlm" and not any((expect_text, expect_absent_text, expect_window, state_contract)):
@@ -1338,6 +1426,7 @@ $out | ConvertTo-Json -Compress
         if target is None:
             return f"error: {selection_error}"
         initial_target = dict(target)
+        repair_method = "initial ranked selector"
 
         # Re-capture and re-locate immediately before input. This closes the
         # same-window stale-content gap that geometry checks alone cannot see.
@@ -1347,10 +1436,14 @@ $out | ConvertTo-Json -Compress
             return f"error: target could not be revalidated immediately before click: {exc}"
         if before.handle != initial.handle:
             return "error: foreground window changed during visual target revalidation; no click was delivered"
-        matches, source, before_elements = self._locate_details(before, text, language)
-        target, selection_error = self._select_target(matches, occurrence)
+        matches, source, before_elements = self._locate_details(
+            before, text, language, role=role, anchor=anchor,
+        )
+        target, repair_method = self.selector_engine.revalidate(
+            initial_target, matches, occurrence,
+        )
         if target is None:
-            return f"error: target changed during visual revalidation ({selection_error}); no click was delivered"
+            return f"error: target changed during visual revalidation ({repair_method}); no click was delivered"
         if self._target_moved(initial_target, target):
             # One relocation may be layout settling or an animated target. A
             # third immediate observation must show a stable target before any
@@ -1362,13 +1455,18 @@ $out | ConvertTo-Json -Compress
                 return f"error: moving target could not be stabilized before click: {exc}; no click was delivered"
             if stable.handle != initial.handle:
                 return "error: foreground window changed while stabilizing moving target; no click was delivered"
-            stable_matches, source, before_elements = self._locate_details(stable, text, language)
-            stable_target, selection_error = self._select_target(stable_matches, occurrence)
+            stable_matches, source, before_elements = self._locate_details(
+                stable, text, language, role=role, anchor=anchor,
+            )
+            stable_target, stabilization_method = self.selector_engine.revalidate(
+                second_target, stable_matches, occurrence,
+            )
             if stable_target is None:
-                return f"error: moving target disappeared during stabilization ({selection_error}); no click was delivered"
+                return f"error: moving target disappeared during stabilization ({stabilization_method}); no click was delivered"
             if self._target_moved(second_target, stable_target):
                 return "error: visual target is still moving; wait for it to settle before retrying; no click was delivered"
             before, target = stable, stable_target
+            repair_method = stabilization_method
 
         semantic_before: tuple[tuple[Any, ...], ...] = ()
         if (expect_text or expect_absent_text or state_contract) and not before_elements:
@@ -1469,10 +1567,13 @@ $out | ConvertTo-Json -Compress
                     contract=state_contract, contract_result=last_contract_result,
                 )
                 if verified:
+                    self._record_selector_result(target, True)
                     return (
                         f"Verified target window closed after visual click on {target['text']!r}; "
+                        f"selector={target.get('selector_strategy', source)}; repair={repair_method}; "
                         f"attempts={attempts}; input={delivered}; state_transition={transition}"
                     )
+                self._record_selector_result(target, False)
                 return (
                     f"error: target window closed before requested postconditions could be verified; "
                     f"state_transition={transition}"
@@ -1500,6 +1601,7 @@ $out | ConvertTo-Json -Compress
                         outcome="focus-left-application", before_elements=before_elements,
                         contract=state_contract,
                     )
+                    self._record_selector_result(target, False)
                     return (
                         f"error: click was delivered to {target['text']!r}, but focus moved to another "
                         f"application {foreground['title']!r}; inspect it before claiming success; "
@@ -1513,6 +1615,7 @@ $out | ConvertTo-Json -Compress
                         outcome="protected-result", before_elements=before_elements,
                         contract=state_contract,
                     )
+                    self._record_selector_result(target, False)
                     return (
                         f"error: click opened a protected or unsupported surface: {exc}; "
                         f"state_transition={transition}"
@@ -1579,8 +1682,10 @@ $out | ConvertTo-Json -Compress
                             before_elements=before_elements, after_elements=after_elements,
                             contract=state_contract, contract_result=last_contract_result,
                         )
+                        self._record_selector_result(target, True)
                         return (
                             f"Verified visual action on {target['text']!r} via {source}; {last_evidence}; "
+                            f"selector={target.get('selector_strategy', source)}; repair={repair_method}; "
                             f"attempts={attempts}; resulting_window={after.title!r}; "
                             f"before={before.image_hash}; after={after.image_hash}; "
                             f"state_transition={transition}"
@@ -1593,6 +1698,7 @@ $out | ConvertTo-Json -Compress
                     before_elements=before_elements, after_elements=last_elements,
                     contract=state_contract, contract_result=last_contract_result,
                 )
+                self._record_selector_result(target, False)
                 return (
                     f"error: click was delivered to {target['text']!r}, but verification timed out; "
                     f"{last_evidence}; attempts={attempts}; input={delivered}; state_transition={transition}"

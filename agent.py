@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from jarvis_mark2 import MARK2_TOOL_NAMES, MARK2_TOOLS, READ_ONLY_MARK2_TOOLS, Mark2Runtime
+from jarvis_mark2 import (
+    MARK2_TOOL_NAMES, MARK2_TOOLS, READ_ONLY_MARK2_TOOLS, Mark2Runtime,
+    tool_result_error,
+)
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -573,13 +576,13 @@ class LocalAgent:
                             result = "error: repeated failed action blocked; inspect state or use a different approach"
                         else:
                             result = await self._run_tool(name, args)
-                        if result.lower().startswith('error:'):
+                        if tool_result_error(result):
                             failure_counts[signature] = failure_counts.get(signature, 0) + 1
                         elif name in {'observe_screen', 'find_visual_text', 'find_visual_target', 'wait_for_visual_text'}:
                             visual_observed = True
                         if name in {'interact_ui', 'control_window', 'click_visual_text', 'click_visual_target', 'learn_visual_target', 'wait_for_visual_text', 'position_window',
                                     'type_text', 'send_keys', 'launch_app', 'mouse_action'}:
-                            recovery_pending = result.lower().startswith('error:')
+                            recovery_pending = tool_result_error(result)
                     self.messages.append(
                         {
                             "role": "tool",

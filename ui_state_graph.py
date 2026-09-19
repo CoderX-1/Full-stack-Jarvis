@@ -157,9 +157,11 @@ class UIStateGraph:
                 "box": [int(raw.get(key) or 0) for key in ("x", "y", "width", "height")], "children": [],
             })
         by_key = {item["key"]: item for item in controls}
+        parent_keys: dict[str, str] = {}
         roots: list[str] = []
         for item in controls:
             parent = item.pop("parent_key")
+            parent_keys[item["key"]] = parent
             if parent and parent in by_key and parent != item["key"]:
                 by_key[parent]["children"].append(item["key"])
             else:
@@ -172,7 +174,34 @@ class UIStateGraph:
         progress_controls = [item for item in controls if item["role"] == "progressbar"]
         busy_words = {"running", "notresponding", "blockedbymodalwindow", "closing"}
         busy = [item for item in controls if _words(item["interaction_state"]).replace(" ", "") in busy_words]
-        errors = [item for item in controls if any(word in _words(item["name"]).split() for word in ("error", "failed", "failure"))]
+        # Treat status-shaped labels as errors, not arbitrary content that
+        # merely discusses an error (commit history, webpages, chat, files).
+        # Broad keyword matching made an otherwise-idle VS Code window report
+        # operation=error when commit messages contained "error handling".
+        def has_error_context(item: dict[str, Any]) -> bool:
+            current = item
+            for _depth in range(12):
+                if current["role"] in {"alert", "dialog", "status", "statusbar"}:
+                    return True
+                parent = parent_keys.get(current["key"], "")
+                if not parent or parent not in by_key:
+                    return False
+                current = by_key[parent]
+            return False
+
+        errors = []
+        for item in controls:
+            name = _words(item["name"])
+            automation_id = _words(item["automation_id"])
+            failure_word = any(
+                word in name.split() for word in ("error", "errors", "failed", "failure")
+            )
+            id_marks_error = any(
+                word in automation_id.split()
+                for word in ("error", "errors", "failed", "failure")
+            )
+            if (failure_word and has_error_context(item)) or id_marks_error:
+                errors.append(item)
         title = str(getattr(observation, "title", ""))
         modified = title.rstrip().endswith("*") or any(marker in _words(title).split() for marker in ("unsaved", "modified"))
         progress: list[float] = []

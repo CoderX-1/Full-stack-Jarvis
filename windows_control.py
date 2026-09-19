@@ -7,6 +7,7 @@ delivered is not treated as proof that an application accepted an operation.
 from __future__ import annotations
 
 import ctypes
+import base64
 import json
 import math
 import os
@@ -195,7 +196,10 @@ class WindowsControl:
             errors="replace",
         )
         if completed.returncode:
-            raise RuntimeError((completed.stderr or completed.stdout or "PowerShell failed").strip())
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(
+                detail or f"PowerShell failed with exit code {completed.returncode}"
+            )
         return (completed.stdout or "").strip()
 
     def _start_apps(self, refresh: bool = False) -> list[dict[str, str]]:
@@ -1054,7 +1058,15 @@ $pattern.Invoke()
         except (RuntimeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             return f"unsupported: guarded accessibility invoke unavailable ({str(exc)[:120]})"
         if result.get("blocked"):
-            return f"error: guarded accessibility invoke refused because {result.get('reason')}; no action was delivered"
+            reason = str(result.get("reason") or "accessible invoke was blocked")
+            if reason.casefold() == "accessible element belongs to another process":
+                # Packaged Windows apps commonly host their visible HWND in
+                # ApplicationFrameHost while UIA reports the child app PID.
+                # No action was delivered, and guarded_click will independently
+                # recheck the top-level HWND, foreground, rectangle, point
+                # ownership, and occlusion before physical input.
+                return "unsupported: accessible element belongs to a hosted child process; no action was delivered"
+            return f"error: guarded accessibility invoke refused because {reason}; no action was delivered"
         if not result.get("invoked"):
             return f"unsupported: {result.get('reason') or 'control is not invokable'}"
         problem = safety_error()
@@ -1111,6 +1123,9 @@ $pattern.Invoke()
         blocked = self._powershell_rectangles(password_rectangles)
         script = f"""
 Add-Type -AssemblyName UIAutomationClient
+function ConvertTo-UiBase64($value){{
+ [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$value))
+}}
 $root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]{int(hwnd)})
 $all=$root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)
 $walker=[Windows.Automation.TreeWalker]::ControlViewWalker
@@ -1151,24 +1166,51 @@ foreach($el in $all){{
    try{{if($el.TryGetCurrentPattern($patternId,[ref]$pattern)){{$actionable=$true;break}}}}catch{{}}
   }}
   if(($name -or $id -or $help -or $accessKey -or $actionable) -and $r.Width -gt 0 -and $r.Height -gt 0){{
-   $out += [pscustomobject]@{{name=$name;id=$id;help=$help;access_key=$accessKey;class=$className;type=$el.Current.ControlType.ProgrammaticName;enabled=$el.Current.IsEnabled;focusable=$el.Current.IsKeyboardFocusable;focused=$el.Current.HasKeyboardFocus;actionable=$actionable;runtime_id=$runtimeId;parent_runtime_id=$parentRuntimeId;selected=$selected;toggle_state=$toggleState;expand_state=$expandState;value_present=$valuePresent;range_value=$rangeValue;range_min=$rangeMin;range_max=$rangeMax;is_modal=$isModal;interaction_state=$interactionState;x=[int]$r.X;y=[int]$r.Y;width=[int]$r.Width;height=[int]$r.Height}}
+    $out += [pscustomobject]@{{name_b64=(ConvertTo-UiBase64 $name);id_b64=(ConvertTo-UiBase64 $id);help_b64=(ConvertTo-UiBase64 $help);access_key_b64=(ConvertTo-UiBase64 $accessKey);class_b64=(ConvertTo-UiBase64 $className);type=$el.Current.ControlType.ProgrammaticName;enabled=$el.Current.IsEnabled;focusable=$el.Current.IsKeyboardFocusable;focused=$el.Current.HasKeyboardFocus;actionable=$actionable;runtime_id=$runtimeId;parent_runtime_id=$parentRuntimeId;selected=$selected;toggle_state=$toggleState;expand_state=$expandState;value_present=$valuePresent;range_value=$rangeValue;range_min=$rangeMin;range_max=$rangeMax;is_modal=$isModal;interaction_state=$interactionState;x=[int]$r.X;y=[int]$r.Y;width=[int]$r.Width;height=[int]$r.Height}}
   }}
  }}catch{{$failures += $_.Exception.Message}}
 }}
 if($out.Count -eq 0 -and $failures.Count -gt 0){{
- [pscustomobject]@{{__uia_error=($failures | Select-Object -First 3) -join '; '}} | ConvertTo-Json -Compress
+  [pscustomobject]@{{__uia_error_b64=(ConvertTo-UiBase64 (($failures | Select-Object -First 3) -join '; '))}} | ConvertTo-Json -Compress
 }}else{{
  $out | ConvertTo-Json -Compress
 }}
 """
         raw = self._run_powershell(script, timeout=15)
-        parsed: Any = json.loads(raw) if raw else []
+        # Windows PowerShell 5.1's ConvertTo-Json can emit literal C0 bytes
+        # found in third-party accessibility labels (observed in VS Code).
+        # One malformed label must not discard the entire window state. Parse
+        # that legacy output tolerantly, then remove the unsafe characters
+        # before any label reaches matching, formatting, or persistence.
+        parsed: Any = json.loads(raw, strict=False) if raw else []
         if isinstance(parsed, dict):
             parsed = [parsed]
+        parsed = [
+            {
+                key: (
+                    re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
+                    if isinstance(value, str)
+                    else value
+                )
+                for key, value in item.items()
+            }
+            for item in parsed
+            if isinstance(item, dict)
+        ]
+        for item in parsed:
+            for field in ("name", "id", "help", "access_key", "class", "__uia_error"):
+                encoded = item.pop(f"{field}_b64", None)
+                if encoded is None:
+                    continue
+                try:
+                    decoded = base64.b64decode(str(encoded), validate=True).decode("utf-8", errors="replace")
+                except (ValueError, UnicodeError):
+                    decoded = ""
+                item[field] = re.sub(r"[\x00-\x1f\x7f]+", " ", decoded).strip()
         diagnostic = next((item.get("__uia_error") for item in parsed if isinstance(item, dict) and item.get("__uia_error")), None)
         if diagnostic:
             raise RuntimeError(f"UI Automation state inspection failed: {str(diagnostic)[:500]}")
-        return [item for item in parsed if isinstance(item, dict)]
+        return parsed
 
     def inspect_ui(self, window: str, limit: int = 80) -> str:
         self._require_windows()

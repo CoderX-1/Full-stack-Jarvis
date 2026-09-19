@@ -46,6 +46,7 @@ READ_ONLY_MARK2_TOOLS = {
     "list_known_folders",
     "find_files",
     "vision_status",
+    "selector_engine_status",
     "ui_state_graph_status",
     "recent_ui_transitions",
     "inspect_ui_state",
@@ -55,6 +56,20 @@ READ_ONLY_MARK2_TOOLS = {
     "find_visual_target",
     "wait_for_visual_text",
 }
+
+
+def tool_result_error(result: str) -> bool:
+    """Recognize canonical and safely wrapped recoverable errors."""
+    value = str(result or "").strip().casefold()
+    return bool(re.search(r"(?:^|;\s*)error:", value))
+
+
+def tool_result_failed(result: str) -> bool:
+    """Recognize errors and denied results for audit truthfulness."""
+    value = str(result or "").strip().casefold()
+    return tool_result_error(value) or bool(
+        re.search(r"(?:^|;\s*)denied(?::|\b)", value)
+    )
 
 UI_STATE_CONTRACT_SCHEMA = {
     "type": "object",
@@ -258,6 +273,14 @@ MARK2_TOOLS.extend([
     {
         "type": "function",
         "function": {
+            "name": "selector_engine_status",
+            "description": "Report Self-Healing Selector Engine ranking, fresh-revalidation, loop-prevention, bounded learning, and privacy status. Read-only.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ui_state_graph_status",
             "description": "Report privacy-safe UI State Graph health, bounded state/transition counts, and persistence status. The graph is observational evidence and never grants permission or blindly replays actions.",
             "parameters": {"type": "object", "properties": {}},
@@ -359,12 +382,14 @@ MARK2_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "find_visual_target",
-            "description": "Find a visible target using confidence-fused OCR, enriched accessibility metadata, role/position/color/shape descriptions, an explicit learned template, or the offline local Florence semantic fallback. Returns boxes without input.",
+            "description": "Build a ranked, self-healing selector plan from stable accessibility identity, access-key metadata, role, optional contextual anchor, OCR, template, guarded geometry, or offline Florence. Returns live boxes without input; learned memory stores hashes and statistics only.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "window": {"type": "string"},
                     "target": {"type": "string", "description": "Visible label, natural semantic description such as settings gear, role/position/color/shape description, or template:name"},
+                    "role": {"type": "string", "description": "Optional expected role such as button, tab, edit, checkbox, or menuitem"},
+                    "anchor": {"type": "string", "description": "Optional nearby or parent visible label used as live context; never persisted raw"},
                     "language": {"type": "string"},
                 },
                 "required": ["window", "target"],
@@ -399,6 +424,8 @@ MARK2_TOOLS.extend([
                 "properties": {
                     "window": {"type": "string"},
                     "target": {"type": "string"},
+                    "role": {"type": "string"},
+                    "anchor": {"type": "string"},
                     "occurrence": {"type": "integer", "minimum": 0, "maximum": 50},
                     "button": {"type": "string", "enum": ["left", "right", "middle"]},
                     "language": {"type": "string"},
@@ -424,6 +451,8 @@ MARK2_TOOLS.extend([
                 "properties": {
                     "window": {"type": "string"},
                     "text": {"type": "string"},
+                    "role": {"type": "string"},
+                    "anchor": {"type": "string"},
                     "occurrence": {"type": "integer", "minimum": 0, "maximum": 50},
                     "button": {"type": "string", "enum": ["left", "right", "middle"]},
                     "language": {"type": "string"},
@@ -725,7 +754,7 @@ class Mark2Runtime:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": tool,
             "args": safe_args,
-            "success": not result.lower().startswith(("error:", "denied")),
+            "success": not tool_result_failed(result),
             "result": (
                 "[REDACTED: visible window text]"
                 if tool in {"read_window_text", "observe_screen", "find_visual_text", "find_visual_target", "learn_visual_target", "wait_for_visual_text", "click_visual_text", "click_visual_target", "interact_ui", "inspect_ui_state", "verify_ui_state"}
@@ -1113,6 +1142,7 @@ class Mark2Runtime:
                 int(args.get("limit") or 50),
             ),
             "vision_status": lambda: self.windows_vision.status(),
+            "selector_engine_status": lambda: self.windows_vision.selector_engine.status(),
             "ui_state_graph_status": lambda: self.windows_vision.state_graph.status(),
             "recent_ui_transitions": lambda: self.windows_vision.state_graph.recent(
                 int(args.get("limit") or 10)
@@ -1132,7 +1162,8 @@ class Mark2Runtime:
                 str(args["window"]), str(args["text"]), str(args.get("language") or "en")
             ),
             "find_visual_target": lambda: self.windows_vision.find_visual_target(
-                str(args["window"]), str(args["target"]), str(args.get("language") or "en")
+                str(args["window"]), str(args["target"]), str(args.get("language") or "en"),
+                role=str(args.get("role") or ""), anchor=str(args.get("anchor") or ""),
             ),
             "learn_visual_target": lambda: self.windows_vision.learn_visual_target(
                 str(args["window"]), str(args["name"]), str(args["source"]),
@@ -1150,6 +1181,7 @@ class Mark2Runtime:
                 expect_window=str(args.get("expect_window") or ""),
                 timeout_seconds=float(args.get("timeout_seconds") or 2.0),
                 expected_state=dict(args.get("expected_state") or {}),
+                role=str(args.get("role") or ""), anchor=str(args.get("anchor") or ""),
             ),
             "click_visual_target": lambda: self.windows_vision.click_visual_target(
                 str(args["window"]), str(args["target"]), int(args.get("occurrence") or 0),
@@ -1161,6 +1193,7 @@ class Mark2Runtime:
                 expect_window=str(args.get("expect_window") or ""),
                 timeout_seconds=float(args.get("timeout_seconds") or 2.0),
                 expected_state=dict(args.get("expected_state") or {}),
+                role=str(args.get("role") or ""), anchor=str(args.get("anchor") or ""),
             ),
             "save_diagnostic_snapshot": lambda: self.windows_vision.save_diagnostic_snapshot(
                 str(args["window"]), str(args.get("language") or "en")
