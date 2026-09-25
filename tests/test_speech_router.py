@@ -61,6 +61,59 @@ class StreamResponse(Response):
         return iter(self.lines)
 
 
+class FishResponse(Response):
+    def __init__(self, chunks, status=200):
+        super().__init__({}, status)
+        self.chunks = chunks
+
+    def iter_bytes(self, chunk_size=4096):
+        return iter(self.chunks)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class FakePipe:
+    def __init__(self, reads=None):
+        self.reads = list(reads or [])
+        self.writes = []
+
+    def read(self, _size):
+        return self.reads.pop(0) if self.reads else b""
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def close(self):
+        pass
+
+
+class FakeProcess:
+    def __init__(self, pcm=b""):
+        self.stdin = FakePipe()
+        self.stdout = FakePipe([pcm] if pcm else [])
+        self.killed = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+class FakeClient:
+    def __init__(self, response):
+        self.response = response
+        self.request = None
+
+    def stream(self, method, url, **kwargs):
+        self.request = (method, url, kwargs)
+        return self.response
+
+
 class SpeechRouterTests(unittest.TestCase):
     def test_stt_and_tts_circuits_use_independent_cooldowns(self):
         router = load_router({"speech": {
@@ -73,6 +126,116 @@ class SpeechRouterTests(unittest.TestCase):
             router._tts_circuit.trip()
         self.assertEqual(router._stt_circuit.retry_at, 1120.0)
         self.assertEqual(router._tts_circuit.retry_at, 4600.0)
+
+    def test_cloud_tts_route_is_ordered_validated_and_deduplicated(self):
+        router = load_router({"speech": {
+            "tts_provider": "fish",
+            "tts_fallback_providers": ["gemini", "fish", "unknown"],
+        }})
+        self.assertEqual(router.tts_provider_order(), ("fish", "gemini"))
+
+    def test_fish_tts_uses_free_model_header_and_never_puts_key_in_body(self):
+        cfg = {"speech": {
+            "tts_provider": "fish",
+            "tts_fallback_providers": ["gemini"],
+            "fish_model": "s2.1-pro-free",
+            "fish_reference_id": "voice-reference",
+            "fish_temperature": 0.2,
+            "fish_top_p": 0.5,
+            "fish_latency": "balanced",
+            "fish_chunk_length": 200,
+            "fish_speed": 1.0,
+        }}
+        router = load_router(cfg, {"FISH_API_KEY": "fish-secret"})
+        pcm = struct.pack("<hhh", -20, 0, 20)
+        process = FakeProcess(pcm)
+        client = FakeClient(FishResponse([b"fake-mp3"]))
+        with patch.object(router, "_fish_key", return_value="fish-secret"), \
+                patch.object(router.shutil, "which", return_value="ffmpeg"), \
+                patch.object(router.subprocess, "Popen", return_value=process), \
+                patch.object(router, "_fish_http_client", return_value=client):
+            chunks = list(router.stream_fish_tts("Hello Ayaan"))
+        self.assertEqual(chunks[0][0], 24000)
+        np.testing.assert_array_equal(
+            chunks[0][1], np.array([-20, 0, 20], dtype=np.int16))
+        method, url, request = client.request
+        self.assertEqual((method, url), ("POST", router._FISH_URL))
+        self.assertEqual(request["headers"]["model"], "s2.1-pro-free")
+        self.assertEqual(request["headers"]["Authorization"],
+                         "Bearer fish-secret")
+        self.assertEqual(request["json"], {
+            "text": "Hello Ayaan", "format": "mp3",
+            "reference_id": "voice-reference",
+            "temperature": 0.2,
+            "top_p": 0.5,
+            "latency": "balanced",
+            "chunk_length": 200,
+            "normalize": True,
+            "condition_on_previous_chunks": True,
+            "prosody": {
+                "speed": 1.0,
+                "volume": 0,
+                "normalize_loudness": True,
+            },
+        })
+        self.assertNotIn("fish-secret", str(request["json"]))
+        router.log.assert_called_once()
+        self.assertNotIn("fish-secret", str(router.log.call_args))
+
+    def test_fish_tts_failure_opens_only_fish_circuit(self):
+        router = load_router(
+            {"speech": {"tts_provider": "fish",
+                         "tts_fallback_providers": ["gemini"],
+                         "fish_reference_id": "voice-reference"}},
+            {"FISH_API_KEY": "fish-secret", "GEMINI_API_KEY": "g-key"},
+        )
+        process = FakeProcess()
+        client = FakeClient(FishResponse([], status=429))
+        with patch.object(router, "_fish_key", return_value="fish-secret"), \
+                patch.object(router.shutil, "which", return_value="ffmpeg"), \
+                patch.object(router.subprocess, "Popen", return_value=process), \
+                patch.object(router, "_fish_http_client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                list(router.stream_fish_tts("Hello"))
+        self.assertFalse(router._fish_tts_circuit.available())
+        self.assertTrue(router._tts_circuit.available())
+
+    def test_fish_requires_a_fixed_reference_voice(self):
+        router = load_router(
+            {"speech": {"tts_provider": "fish", "fish_reference_id": ""}},
+            {"FISH_API_KEY": "fish-secret"},
+        )
+        with patch.object(router, "_fish_key", return_value="fish-secret"):
+            self.assertFalse(router.fish_tts_enabled())
+            self.assertEqual(
+                router.fish_voice_status(),
+                (False, "reference-voice-missing"),
+            )
+
+    def test_fish_sampling_and_latency_settings_are_bounded(self):
+        cfg = {"speech": {
+            "tts_provider": "fish",
+            "fish_reference_id": "fixed-voice",
+            "fish_temperature": 9,
+            "fish_top_p": -2,
+            "fish_latency": "unsupported",
+            "fish_chunk_length": 999,
+            "fish_speed": 10,
+        }}
+        router = load_router(cfg, {"FISH_API_KEY": "fish-secret"})
+        process = FakeProcess(struct.pack("<h", 1))
+        client = FakeClient(FishResponse([b"fake-mp3"]))
+        with patch.object(router, "_fish_key", return_value="fish-secret"), \
+                patch.object(router.shutil, "which", return_value="ffmpeg"), \
+                patch.object(router.subprocess, "Popen", return_value=process), \
+                patch.object(router, "_fish_http_client", return_value=client):
+            list(router.stream_fish_tts("Consistent voice"))
+        payload = client.request[2]["json"]
+        self.assertEqual(payload["temperature"], 1.0)
+        self.assertEqual(payload["top_p"], 0.0)
+        self.assertEqual(payload["latency"], "balanced")
+        self.assertEqual(payload["chunk_length"], 300)
+        self.assertEqual(payload["prosody"]["speed"], 2.0)
 
     def test_wav_encoding_is_mono_16_bit_at_requested_rate(self):
         router = load_router()

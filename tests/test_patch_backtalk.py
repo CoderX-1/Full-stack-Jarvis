@@ -87,7 +87,9 @@ class BacktalkPatchTests(unittest.TestCase):
             self.assertEqual(
                 ears.count("def _transcribe_local(pcm: np.ndarray) -> str:\n"),
                 1)
-            self.assertIn("Gemini streaming TTS first", mouth)
+            self.assertIn("Fish Audio primary cloud TTS", mouth)
+            self.assertIn("stream_fish_tts", mouth)
+            self.assertIn("allow_local_tts_fallback", mouth)
             self.assertIn("stream_local_urdu", mouth)
             self.assertTrue((package / "speech_router.py").is_file())
             self.assertTrue((root / "PROVIDER_COMPATIBILITY.md").is_file())

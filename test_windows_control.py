@@ -1,3 +1,4 @@
+import ctypes
 import json
 import tempfile
 import unittest
@@ -5,11 +6,32 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from jarvis_mark2 import MARK2_TOOL_NAMES, Mark2Runtime
+from verification_engine import VerificationEngine
 from windows_control import WindowsControl, _norm, _ps_quote
 from windows_vision import VisionObservation, VisionWord, WindowsVision
 
 
 class WindowsControlContractTests(unittest.TestCase):
+    def test_closed_visual_target_satisfies_action_verification_contract(self):
+        result = (
+            "Verified visual action: target window closed after click on 'Don\'t Save'; "
+            "selector=uia; attempts=1"
+        )
+        engine = VerificationEngine()
+        enforced = engine.enforce(
+            "click_visual_text",
+            {"expect_absent_text": "Don't Save"},
+            result,
+        )
+        decision = engine.evaluate(
+            "click_visual_text",
+            {"expect_absent_text": "Don't Save"},
+            enforced,
+        )
+        self.assertEqual(enforced, result)
+        self.assertEqual(decision.status, "verified")
+        self.assertTrue(decision.goal_verified)
+
     def test_focus_does_not_send_alt_or_other_keys(self):
         control = object.__new__(WindowsControl)
         control.user32 = Mock()
@@ -75,6 +97,58 @@ class WindowsControlContractTests(unittest.TestCase):
             result = control.type_text("hello Ayaan", "Notepad", 0)
         self.assertIn("Typed and verified", result)
         self.assertIn("window accessibility text", result)
+
+    def test_type_text_uses_clipboard_free_unicode_sendinput_fallback(self):
+        control = object.__new__(WindowsControl)
+        control.user32 = Mock()
+        control._find_window = Mock(return_value={
+            "handle": 10, "pid": 20, "title": "Untitled - Notepad",
+        })
+        control._focus_handle = Mock(return_value=True)
+        control.user32.GetForegroundWindow.return_value = 10
+        control.user32.VkKeyScanW.return_value = -1
+        control.user32.SendInput.side_effect = lambda count, _events, _size: count
+        control._focused_text_state = Mock(side_effect=[
+            {"pid": 20, "password": False, "supported": True, "text": ""},
+            {"pid": 20, "password": False, "supported": True, "text": "Ω🙂"},
+        ])
+        with patch("time.sleep"):
+            result = control.type_text("Ω🙂", "Notepad", 0)
+        self.assertIn("Typed and verified 2 character(s)", result)
+        self.assertIn("unicode_fallback=2", result)
+        self.assertIn("clipboard=untouched", result)
+        self.assertEqual(control.user32.SendInput.call_count, 2)
+        self.assertEqual(control.user32.SendInput.call_args_list[0].args[0], 2)
+        self.assertEqual(control.user32.SendInput.call_args_list[1].args[0], 4)
+        control.user32.keybd_event.assert_not_called()
+
+    def test_type_text_rejects_non_printing_control_before_delivery(self):
+        control = object.__new__(WindowsControl)
+        control.user32 = Mock()
+        with self.assertRaisesRegex(ValueError, "Unsupported control character"):
+            control.type_text("safe\x00unsafe", "Notepad", 0)
+        control.user32.SendInput.assert_not_called()
+        control.user32.keybd_event.assert_not_called()
+
+    def test_type_text_routes_vk_scan_argument_error_to_unicode(self):
+        control = object.__new__(WindowsControl)
+        control.user32 = Mock()
+        control._find_window = Mock(return_value={
+            "handle": 10, "pid": 20, "title": "Untitled - Notepad",
+        })
+        control._focus_handle = Mock(return_value=True)
+        control.user32.GetForegroundWindow.return_value = 10
+        control.user32.VkKeyScanW.side_effect = ctypes.ArgumentError("UTF-16 unit required")
+        control.user32.SendInput.side_effect = lambda count, _events, _size: count
+        control._focused_text_state = Mock(side_effect=[
+            {"pid": 20, "password": False, "supported": True, "text": ""},
+            {"pid": 20, "password": False, "supported": True, "text": "🙂"},
+        ])
+        with patch("time.sleep"):
+            result = control.type_text("🙂", "Notepad", 0)
+        self.assertIn("Typed and verified 1 character(s)", result)
+        self.assertIn("unicode_fallback=1", result)
+        self.assertEqual(control.user32.SendInput.call_args.args[0], 4)
 
     def test_send_keys_validates_every_chord_before_input(self):
         control = object.__new__(WindowsControl)
@@ -253,7 +327,7 @@ class WindowsControlContractTests(unittest.TestCase):
         control.user32.GetAncestor.return_value = 10
         control.mouse_action.return_value = "mouse verified"
         vision = WindowsVision(control, Path("."))
-        vision.observe = Mock(side_effect=[before, after])
+        vision.observe = Mock(side_effect=[before, before, after])
         vision._change_ratio = Mock(return_value=0.02)
         with patch("time.sleep"):
             result = vision.click_visual_text("Calculator", "7")

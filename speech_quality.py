@@ -2,6 +2,19 @@
 import re
 
 
+_SUPPORTED_NATIVE_SCRIPT = re.compile(r"[\u0600-\u08ff\u0900-\u097f]")
+
+
+def romanize_supported_speech(text: str) -> str:
+    """Turn Gemini's Urdu/Devanagari transcript into fast local Latin text."""
+    value = str(text or "").strip()
+    if not _SUPPORTED_NATIVE_SCRIPT.search(value):
+        return value
+    from unidecode import unidecode
+    value = unidecode(value)
+    return re.sub(r"\s+([,.!?;:])", r"\1", re.sub(r"\s+", " ", value)).strip()
+
+
 def transcript_problem(text: str) -> str | None:
     text = text.strip()
     if not text:

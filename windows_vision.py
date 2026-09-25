@@ -102,6 +102,12 @@ class WindowsVision:
         self.template_dir = state_dir / "vision-targets"
         self.florence = FlorenceClient()
 
+    def _action_abort_requested(self) -> bool:
+        check = getattr(self.control, "action_abort_requested", None)
+        # Test doubles and third-party control adapters can expose dynamic mock
+        # attributes. Only the literal boolean True is an abort request.
+        return check() is True if callable(check) else False
+
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any]:
         try:
@@ -1182,6 +1188,8 @@ $out | ConvertTo-Json -Compress
             raise ValueError("direction must be up or down")
         seen_hashes: set[str] = set()
         for scroll_count in range(scroll_limit + 1):
+            if self._action_abort_requested():
+                return "error: action deadline expired during visual search; no click was delivered"
             observation = self.observe(window, language)
             matches, _source, _elements = self._locate_details(
                 observation, target, language, role=role, anchor=anchor,
@@ -1411,6 +1419,8 @@ $out | ConvertTo-Json -Compress
         contract_validation = self.state_graph.evaluate_contract(None, None, state_contract) if state_contract else {}
         if contract_validation.get("error"):
             return f"error: {contract_validation['error']}; no click was delivered"
+        if self._action_abort_requested():
+            return "error: action deadline expired before visual observation; no click was delivered"
         initial = self.observe(window, language)
         matches, source, before_elements = self._locate_details(
             initial, text, language, role=role, anchor=anchor,
@@ -1511,6 +1521,8 @@ $out | ConvertTo-Json -Compress
             return "error: target window moved or resized after observation; no stale-coordinate click was delivered"
         if int(self.control.user32.GetForegroundWindow() or 0) != before.handle:
             return "error: foreground window changed after observation; no click was delivered"
+        if self._action_abort_requested():
+            return "error: action deadline expired after revalidation; no click was delivered"
         point = wintypes.POINT(int(target["screen_x"]), int(target["screen_y"]))
         hit = int(self.control.user32.WindowFromPoint(point) or 0)
         hit_root = int(self.control.user32.GetAncestor(hit, 2) or 0) if hit else 0  # GA_ROOT
@@ -1548,6 +1560,8 @@ $out | ConvertTo-Json -Compress
         attempts = 0
         time.sleep(min(0.15, timeout))
         while True:
+            if self._action_abort_requested():
+                return "error: action deadline expired during postcondition verification; late success discarded"
             attempts += 1
             rows = self.control.windows()
             original = next((item for item in rows if item["handle"] == before.handle), None)
@@ -1569,7 +1583,7 @@ $out | ConvertTo-Json -Compress
                 if verified:
                     self._record_selector_result(target, True)
                     return (
-                        f"Verified target window closed after visual click on {target['text']!r}; "
+                        f"Verified visual action: target window closed after click on {target['text']!r}; "
                         f"selector={target.get('selector_strategy', source)}; repair={repair_method}; "
                         f"attempts={attempts}; input={delivered}; state_transition={transition}"
                     )

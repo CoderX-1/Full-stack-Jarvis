@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from backtalk.config import CFG, DISCIPLINE
+from backtalk.speech_quality import romanize_supported_speech
 from backtalk.vlog import log
 
 
@@ -34,6 +35,25 @@ class PermissionResultDeny:
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
+_MOJIBAKE_MARKERS = (
+    "\u00e0\u00a4", "\u00e0\u00a5", "\u00e6\u02c6", "\u00e7\u2022",
+    "\u00e5\u2026", "\u00d9", "\u00d8", "\u00db", "\u00ef\u00bf\u00bd",
+)
+
+
+def speech_text_supported(text: str) -> bool:
+    """Restrict the voice channel to clear English/Roman-Urdu Latin text."""
+    value = str(text or "")
+    if any(marker in value for marker in _MOJIBAKE_MARKERS):
+        return False
+    for character in value:
+        codepoint = ord(character)
+        if (0x0600 <= codepoint <= 0x08FF
+                or 0x0900 <= codepoint <= 0x097F
+                or 0x3040 <= codepoint <= 0x30FF
+                or 0x3400 <= codepoint <= 0x9FFF):
+            return False
+    return True
 
 
 def _load_runner():
@@ -164,7 +184,16 @@ class WarmBrain:
         if not self._agent:
             raise RuntimeError("brain is not connected")
         self._interrupted = False
+        normalized = romanize_supported_speech(utterance)
+        if normalized != utterance.strip():
+            log("[ears] converted native-script speech to Roman text locally")
+        utterance = normalized
+        if not speech_text_supported(utterance):
+            yield "I couldn't understand that clearly. Please repeat in English or Roman Urdu."
+            return
         reply = await self._agent.ask(utterance)
+        if not speech_text_supported(reply):
+            reply = "I couldn't understand that clearly. Please repeat in English or Roman Urdu."
         self.session["turns"] += 1
         self.session["in_tokens"] = self._agent.usage["input_tokens"]
         self.session["out_tokens"] = self._agent.usage["output_tokens"]

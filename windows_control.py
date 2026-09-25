@@ -13,6 +13,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -32,13 +33,25 @@ class _MouseInput(ctypes.Structure):
     ]
 
 
+class _KeyboardInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
 class _InputUnion(ctypes.Union):
-    _fields_ = [("mi", _MouseInput)]
+    _fields_ = [("mi", _MouseInput), ("ki", _KeyboardInput)]
 
 
 class _Input(ctypes.Structure):
     _anonymous_ = ("value",)
     _fields_ = [("type", wintypes.DWORD), ("value", _InputUnion)]
+
+
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
 
 def _norm(value: str) -> str:
@@ -86,6 +99,11 @@ class WindowsControl:
     def __init__(self, base_dir: Path | None = None) -> None:
         self.base_dir = (base_dir or Path.cwd()).resolve()
         self._apps_cache: tuple[float, list[dict[str, str]]] = (0.0, [])
+        self._action_abort = threading.Event()
+        self._action_abort_reason = ""
+        self._guard_input_tick: int | None = None
+        self._last_agent_input_tick: int | None = None
+        self._user_input_interrupted = False
         if IS_WINDOWS:
             self.user32 = ctypes.windll.user32
             self.kernel32 = ctypes.windll.kernel32
@@ -100,6 +118,12 @@ class WindowsControl:
         except (AttributeError, OSError):
             pass
         self.user32.GetForegroundWindow.restype = wintypes.HWND
+        self.user32.GetLastActivePopup.argtypes = [wintypes.HWND]
+        self.user32.GetLastActivePopup.restype = wintypes.HWND
+        self.user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        self.user32.GetWindow.restype = wintypes.HWND
+        self.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LastInputInfo)]
+        self.user32.GetLastInputInfo.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
         self.user32.IsWindowVisible.restype = wintypes.BOOL
         self.user32.IsWindowEnabled.argtypes = [wintypes.HWND]
@@ -155,6 +179,100 @@ class WindowsControl:
         if not IS_WINDOWS:
             raise RuntimeError("Windows desktop control is available only on Windows")
 
+    def begin_guarded_action(self) -> None:
+        """Clear the cooperative abort signal immediately before one mutation."""
+        signal = getattr(self, "_action_abort", None)
+        if signal is None:
+            signal = threading.Event()
+            self._action_abort = signal
+        signal.clear()
+        self._action_abort_reason = ""
+        self._user_input_interrupted = False
+        self._guard_input_tick = self.last_input_tick()
+
+    def action_abort_requested(self) -> bool:
+        signal = getattr(self, "_action_abort", None)
+        return bool(signal.is_set()) if signal is not None else False
+
+    def action_abort_reason(self) -> str:
+        return str(getattr(self, "_action_abort_reason", "") or "watchdog deadline")
+
+    def last_input_tick(self) -> int | None:
+        """Return Windows' wrap-safe last keyboard/mouse input tick."""
+        if not IS_WINDOWS or not hasattr(self, "user32"):
+            return None
+        info = _LastInputInfo(cbSize=ctypes.sizeof(_LastInputInfo), dwTime=0)
+        try:
+            return int(info.dwTime) if self.user32.GetLastInputInfo(ctypes.byref(info)) else None
+        except (AttributeError, TypeError, OSError):
+            return None
+
+    def recent_physical_input(self, quiet_ms: int = 450) -> bool:
+        """Detect recent input not attributable to JARVIS' last injection."""
+        tick = self.last_input_tick()
+        if tick is None or tick == getattr(self, "_last_agent_input_tick", None):
+            return False
+        try:
+            now = int(self.kernel32.GetTickCount()) & 0xFFFFFFFF
+        except (AttributeError, TypeError, OSError):
+            return False
+        age = (now - tick) & 0xFFFFFFFF
+        return age < max(100, min(int(quiet_ms), 2000))
+
+    def mark_agent_input(self) -> None:
+        tick = self.last_input_tick()
+        if tick is not None:
+            self._last_agent_input_tick = tick
+            self._guard_input_tick = tick
+
+    def user_input_interrupted(self) -> bool:
+        """Cooperatively stop when physical input changes during an action."""
+        tick = self.last_input_tick()
+        baseline = getattr(self, "_guard_input_tick", None)
+        if tick is None or baseline is None or tick == baseline:
+            return False
+        if tick == getattr(self, "_last_agent_input_tick", None):
+            self._guard_input_tick = tick
+            return False
+        self._user_input_interrupted = True
+        self._action_abort_reason = "user physical input detected"
+        signal = getattr(self, "_action_abort", None)
+        if signal is not None:
+            signal.set()
+        return True
+
+    def take_user_input_interruption(self) -> bool:
+        value = bool(getattr(self, "_user_input_interrupted", False))
+        self._user_input_interrupted = False
+        return value
+
+    def contain_stuck_action(self) -> None:
+        """Request cooperative stop and release common agent input states.
+
+        This runs on the watchdog timer thread. Key/button-up events are safe to
+        repeat and prevent a timed-out input path from leaving modifiers or a
+        mouse button logically held.
+        """
+        signal = getattr(self, "_action_abort", None)
+        if signal is None:
+            signal = threading.Event()
+            self._action_abort = signal
+        signal.set()
+        self._action_abort_reason = "watchdog deadline"
+        if not IS_WINDOWS:
+            return
+        for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C):  # shift, ctrl, alt, win keys
+            try:
+                self.user32.keybd_event(vk, 0, 0x0002, 0)
+                self.mark_agent_input()
+            except Exception:
+                pass
+        for flag in (0x0004, 0x0010, 0x0040):  # left/right/middle button up
+            try:
+                self._inject_mouse(flag)
+            except Exception:
+                pass
+
     def _inject_mouse(self, flags: int, data: int = 0) -> str:
         """Prefer SendInput and retain a legacy fallback for older environments."""
         event = _Input(type=0, mi=_MouseInput(
@@ -163,10 +281,12 @@ class WindowsControl:
         ))
         try:
             if int(self.user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(_Input))) == 1:
+                self.mark_agent_input()
                 return "SendInput"
         except (AttributeError, TypeError, ValueError, OSError):
             pass
         self.user32.mouse_event(int(flags), 0, 0, int(data), 0)
+        self.mark_agent_input()
         return "mouse_event"
 
     def _inject_click(self, down: int, up: int) -> str:
@@ -177,11 +297,13 @@ class WindowsControl:
         )
         try:
             if int(self.user32.SendInput(2, events, ctypes.sizeof(_Input))) == 2:
+                self.mark_agent_input()
                 return "SendInput"
         except (AttributeError, TypeError, ValueError, OSError):
             pass
         self.user32.mouse_event(int(down), 0, 0, 0, 0)
         self.user32.mouse_event(int(up), 0, 0, 0, 0)
+        self.mark_agent_input()
         return "mouse_event"
 
     @staticmethod
@@ -433,6 +555,84 @@ $out | ConvertTo-Json -Compress
                            f"minimized={row.get('minimized', False)})" for row in matches[:6])
         raise ValueError(f"Window name is ambiguous. Matches: {titles}")
 
+    def modal_blocker_snapshot(self, window: str = "") -> dict[str, Any]:
+        """Fresh, privacy-safe modal blocker check for an intended window."""
+        self._require_windows()
+        target = self._find_window(window)
+        handle = int(target["handle"])
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        popup = int(self.user32.GetLastActivePopup(handle) or 0)
+        target_enabled = bool(self.user32.IsWindowEnabled(handle))
+        owned_dialogs: list[dict[str, Any]] = []
+        try:
+            for row in self.windows():
+                candidate = int(row["handle"])
+                if candidate == handle:
+                    continue
+                if (
+                    int(self.user32.GetWindow(candidate, 4) or 0) == handle
+                    and self.user32.IsWindowVisible(candidate)
+                    and self.user32.IsWindowEnabled(candidate)
+                ):
+                    owned_dialogs.append(row)
+        except Exception:
+            owned_dialogs = []
+        owned_dialogs.sort(key=lambda row: (not bool(row.get("foreground")), int(row["handle"])))
+        owned_dialog = owned_dialogs[0] if owned_dialogs else None
+        native_popup = bool(
+            popup and popup != handle and self.user32.IsWindow(popup)
+            and self.user32.IsWindowVisible(popup) and self.user32.IsWindowEnabled(popup)
+        )
+        owned_foreground = bool(
+            foreground and foreground != handle
+            and int(self.user32.GetWindow(foreground, 4) or 0) == handle  # GW_OWNER
+        )
+        uia_blocked = False
+        try:
+            for item in self.ui_elements(handle, 500):
+                state = str(item.get("interaction_state") or "").replace(" ", "").casefold()
+                if state == "blockedbymodalwindow":
+                    uia_blocked = True
+                    break
+        except Exception:
+            # Native popup/owner checks still provide a fresh fail-closed signal
+            # on applications whose accessibility provider is unavailable.
+            pass
+        sources = []
+        if native_popup:
+            sources.append("active-popup")
+        if owned_foreground:
+            sources.append("owned-foreground")
+        if owned_dialog:
+            sources.append("owned-dialog")
+        if uia_blocked:
+            sources.append("uia-blocked")
+        if not target_enabled:
+            sources.append("target-disabled")
+        dialog_handle = 0
+        dialog_pid = 0
+        if native_popup:
+            dialog_handle = popup
+        elif owned_dialog:
+            dialog_handle = int(owned_dialog["handle"])
+            dialog_pid = int(owned_dialog["pid"])
+        elif owned_foreground:
+            dialog_handle = foreground
+        if dialog_handle and not dialog_pid:
+            pid = wintypes.DWORD()
+            self.user32.GetWindowThreadProcessId(dialog_handle, ctypes.byref(pid))
+            dialog_pid = int(pid.value)
+        return {
+            "blocked": bool(sources),
+            "sources": sources,
+            "target_handle": handle,
+            "target_pid": int(target["pid"]),
+            "dialog_selector": (
+                f"hwnd:{dialog_handle}:pid:{dialog_pid}"
+                if dialog_handle and dialog_pid else ""
+            ),
+        }
+
     def _focus_handle(self, hwnd: int) -> bool:
         if self.user32.IsIconic(hwnd):
             self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
@@ -486,6 +686,8 @@ $out | ConvertTo-Json -Compress
         latest: list[dict[str, Any]] = []
         started_at = time.monotonic()
         while time.monotonic() < deadline:
+            if self.action_abort_requested():
+                return "error: app launch deadline expired; watchdog containment requested"
             time.sleep(0.25)
             latest = self.windows()
             new = [row for row in latest if (row["handle"], row["pid"]) not in before]
@@ -553,6 +755,8 @@ $out | ConvertTo-Json -Compress
             self.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE, never force-kill
             deadline = time.monotonic() + 4
             while self.user32.IsWindow(hwnd) and time.monotonic() < deadline:
+                if self.action_abort_requested():
+                    return "error: window close deadline expired; watchdog containment requested"
                 time.sleep(0.1)
             ok = not bool(self.user32.IsWindow(hwnd))
             if not ok:
@@ -607,6 +811,32 @@ $out | ConvertTo-Json -Compress
     def _tap_vk(self, vk: int) -> None:
         self.user32.keybd_event(vk, 0, 0, 0)
         self.user32.keybd_event(vk, 0, 0x0002, 0)
+        self.mark_agent_input()
+
+    def _inject_unicode_character(self, character: str) -> None:
+        """Inject one Unicode scalar through UTF-16 without touching clipboard."""
+        units = [
+            int.from_bytes(encoded[index:index + 2], "little")
+            for encoded in [character.encode("utf-16-le", errors="surrogatepass")]
+            for index in range(0, len(encoded), 2)
+        ]
+        events = []
+        for unit in units:
+            events.extend((
+                _Input(type=1, ki=_KeyboardInput(
+                    wVk=0, wScan=unit, dwFlags=0x0004, time=0, dwExtraInfo=0,
+                )),
+                _Input(type=1, ki=_KeyboardInput(
+                    wVk=0, wScan=unit, dwFlags=0x0004 | 0x0002, time=0, dwExtraInfo=0,
+                )),
+            ))
+        batch = (_Input * len(events))(*events)
+        delivered = int(self.user32.SendInput(len(events), batch, ctypes.sizeof(_Input)))
+        if delivered != len(events):
+            raise RuntimeError(
+                f"Windows delivered {delivered}/{len(events)} Unicode keyboard events"
+            )
+        self.mark_agent_input()
 
     def send_keys(self, keys: str, window: str = "", interval_ms: int = 40) -> str:
         self._require_windows()
@@ -636,6 +866,10 @@ $out | ConvertTo-Json -Compress
                 codes.append(code)
             parsed_chords.append(codes)
         for codes in parsed_chords:
+            if self.user_input_interrupted():
+                return "error: user physical input detected; remaining shortcuts stopped"
+            if self.action_abort_requested():
+                return f"error: {self.action_abort_reason()}; remaining shortcuts stopped"
             if int(self.user32.GetForegroundWindow() or 0) != target_handle:
                 return "error: target lost focus; remaining shortcuts stopped"
             held = []
@@ -646,6 +880,7 @@ $out | ConvertTo-Json -Compress
             finally:
                 for code in reversed(held):
                     self.user32.keybd_event(code, 0, 0x0002, 0)
+                self.mark_agent_input()
             time.sleep(max(0, min(interval_ms, 1000)) / 1000)
         foreground_handle = int(self.user32.GetForegroundWindow() or 0)
         if foreground_handle != target_handle:
@@ -690,12 +925,13 @@ if(-not $password){{
             raise ValueError("Text cannot be empty")
         if len(text) > 10_000:
             raise ValueError("Text is limited to 10,000 characters per action")
-        # Validate the complete input before delivering any of it.
+        # Validate the complete input before delivering any of it. Printable
+        # Unicode is accepted even when the active keyboard layout has no key
+        # mapping; that path uses KEYEVENTF_UNICODE and leaves the clipboard
+        # completely untouched.
         for char in text:
-            if char not in {"\n", "\t"}:
-                encoded = int(self.user32.VkKeyScanW(char))
-                if encoded in {-1, 0xFFFF}:
-                    raise ValueError(f"Unsupported keyboard character: U+{ord(char):04X}; no text was typed")
+            if char not in {"\n", "\t"} and unicodedata.category(char) == "Cc":
+                raise ValueError(f"Unsupported control character: U+{ord(char):04X}; no text was typed")
         target = self._find_window(window) if window else self._find_window("")
         target_handle = int(target["handle"])
         if not self._focus_handle(target_handle):
@@ -722,7 +958,12 @@ if(-not $password){{
                 # receiving focus. The post-state still gets one safe retry.
                 before_window_text = ""
         typed = 0
+        unicode_typed = 0
         for char in text:
+            if self.user_input_interrupted():
+                return f"error: user physical input detected after {typed} character(s); remaining input stopped"
+            if self.action_abort_requested():
+                return f"error: {self.action_abort_reason()} after {typed} character(s); remaining input stopped"
             if int(self.user32.GetForegroundWindow() or 0) != target_handle:
                 return f"error: target lost focus after {typed} character(s); remaining input stopped"
             if char == "\n":
@@ -730,20 +971,35 @@ if(-not $password){{
             elif char == "\t":
                 self._tap_vk(0x09)
             else:
-                encoded = int(self.user32.VkKeyScanW(char))
-                if encoded == -1 or encoded == 0xFFFF:
-                    raise ValueError(f"Character cannot be typed by the active Windows keyboard layout: U+{ord(char):04X}")
-                vk, modifiers = encoded & 0xFF, (encoded >> 8) & 0xFF
-                held = []
                 try:
-                    for mask, code in ((1, 0x10), (2, 0x11), (4, 0x12)):
-                        if modifiers & mask:
-                            held.append(code)
-                            self.user32.keybd_event(code, 0, 0, 0)
-                    self._tap_vk(vk)
-                finally:
-                    for code in reversed(held):
-                        self.user32.keybd_event(code, 0, 0x0002, 0)
+                    encoded = int(self.user32.VkKeyScanW(char))
+                except (ctypes.ArgumentError, TypeError, ValueError):
+                    # Windows WCHAR is one UTF-16 code unit. Supplementary
+                    # characters such as emoji must bypass VkKeyScanW and be
+                    # injected as an explicit surrogate pair.
+                    encoded = -1
+                if encoded in {-1, 0xFFFF}:
+                    try:
+                        self._inject_unicode_character(char)
+                    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                        return (
+                            f"error: Unicode input failed after {typed} complete character(s); "
+                            f"remaining input stopped; {exc}"
+                        )
+                    unicode_typed += 1
+                else:
+                    vk, modifiers = encoded & 0xFF, (encoded >> 8) & 0xFF
+                    held = []
+                    try:
+                        for mask, code in ((1, 0x10), (2, 0x11), (4, 0x12)):
+                            if modifiers & mask:
+                                held.append(code)
+                                self.user32.keybd_event(code, 0, 0, 0)
+                        self._tap_vk(vk)
+                    finally:
+                        for code in reversed(held):
+                            self.user32.keybd_event(code, 0, 0x0002, 0)
+                        self.mark_agent_input()
             typed += 1
             if interval_ms:
                 time.sleep(max(0, min(interval_ms, 250)) / 1000)
@@ -785,7 +1041,8 @@ if(-not $password){{
             ):
                 return (
                     f"Typed and verified {typed} character(s) in {target['title']!r}; "
-                    "foreground, process, and window accessibility text all match"
+                    "foreground, process, and window accessibility text all match; "
+                    f"unicode_fallback={unicode_typed}; clipboard=untouched"
                 )
             return (
                 f"error: typed {typed} character(s) into {target['title']!r}, but its focused "
@@ -802,7 +1059,8 @@ if(-not $password){{
             )
         return (
             f"Typed and verified {typed} character(s) in {target['title']!r}; "
-            "foreground, process, and focused-control content all match"
+            "foreground, process, and focused-control content all match; "
+            f"unicode_fallback={unicode_typed}; clipboard=untouched"
         )
 
     def mouse_action(
@@ -827,6 +1085,7 @@ if(-not $password){{
                 )
             if not self.user32.SetCursorPos(int(x), int(y)):
                 return "error: Windows rejected the cursor movement"
+            self.mark_agent_input()
             positioned = wintypes.POINT()
             self.user32.GetCursorPos(ctypes.byref(positioned))
             if positioned.x != int(x) or positioned.y != int(y):
@@ -842,11 +1101,17 @@ if(-not $password){{
                 raise ValueError("Button must be left, right, or middle")
             down, up = flags[button]
             for _ in range(2 if choice == "double_click" else 1):
+                if self.user_input_interrupted():
+                    return "error: user physical input detected; remaining mouse input stopped"
+                if self.action_abort_requested():
+                    return f"error: {self.action_abort_reason()}; remaining mouse input stopped"
                 self.user32.mouse_event(down, 0, 0, 0, 0)
                 self.user32.mouse_event(up, 0, 0, 0, 0)
+                self.mark_agent_input()
                 time.sleep(0.08)
         elif choice == "scroll":
             self.user32.mouse_event(0x0800, 0, 0, int(amount) * 120, 0)
+            self.mark_agent_input()
         else:
             raise ValueError("Action must be move, click, double_click, or scroll")
         point = wintypes.POINT()
@@ -874,6 +1139,8 @@ if(-not $password){{
             return "error: guarded click target is outside the virtual desktop"
 
         def safety_error() -> str:
+            if self.user_input_interrupted():
+                return "user physical input was detected"
             if not self.user32.IsWindow(handle):
                 return "target window closed"
             if int(self.user32.GetForegroundWindow() or 0) != handle:
@@ -895,6 +1162,7 @@ if(-not $password){{
             return f"error: guarded click refused because {problem}; no click was delivered"
         if not self.user32.SetCursorPos(x, y):
             return "error: Windows rejected guarded cursor positioning; no click was delivered"
+        self.mark_agent_input()
         cursor = wintypes.POINT()
         if not self.user32.GetCursorPos(ctypes.byref(cursor)) or (cursor.x, cursor.y) != (x, y):
             return "error: guarded cursor verification failed; no click was delivered"
@@ -935,6 +1203,8 @@ if(-not $password){{
             return "error: guarded scroll point is outside the virtual desktop; no scroll was delivered"
 
         def safety_error() -> str:
+            if self.user_input_interrupted():
+                return "user physical input was detected"
             if not self.user32.IsWindow(handle):
                 return "target window closed"
             if int(self.user32.GetForegroundWindow() or 0) != handle:
@@ -956,6 +1226,7 @@ if(-not $password){{
             return f"error: guarded scroll refused because {problem}; no scroll was delivered"
         if not self.user32.SetCursorPos(x, y):
             return "error: Windows rejected guarded cursor positioning; no scroll was delivered"
+        self.mark_agent_input()
         cursor = wintypes.POINT()
         if not self.user32.GetCursorPos(ctypes.byref(cursor)) or (cursor.x, cursor.y) != (x, y):
             return "error: guarded scroll cursor verification failed; no scroll was delivered"
@@ -1086,6 +1357,8 @@ $pattern.Invoke()
             raise ValueError("Unsupported media action")
         count = max(1, min(int(steps), 50)) if choice in {"volume_up", "volume_down"} else 1
         for _ in range(count):
+            if self.action_abort_requested():
+                return "error: action deadline expired; remaining media input stopped"
             self._tap_vk(self._VK[mapping[choice]])
             time.sleep(0.03)
         return f"Delivered Windows media action {choice}" + (f" ({count} steps)" if count > 1 else "")

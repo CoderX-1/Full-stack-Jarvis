@@ -1,4 +1,9 @@
-"""Free-first multilingual speech with automatic local fallbacks."""
+"""Cloud speech routing for JARVIS.
+
+Fish Audio is the primary TTS path. Gemini remains an independent cloud
+fallback, while local speech is an explicit policy choice owned by mouth.py.
+No credential or reply text is ever written to the log.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +11,13 @@ import base64
 import io
 import json
 import os
+import queue
+import re
+import shutil
+import subprocess
 import threading
 import time
+import urllib.parse
 import wave
 from dataclasses import dataclass
 
@@ -18,7 +28,13 @@ from backtalk.config import CFG
 from backtalk.vlog import log
 
 _URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+_LIVE_URL = (
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+)
+_FISH_URL = "https://api.fish.audio/v1/tts"
 _REVISION = "2026-05-20"
+_FISH_RATE = 24000
 
 
 @dataclass
@@ -47,7 +63,11 @@ class _Circuit:
 
 
 _stt_circuit = _Circuit("stt")
+_stt_live_circuit = _Circuit("stt_live")
 _tts_circuit = _Circuit("tts")
+_fish_tts_circuit = _Circuit("fish_tts")
+_fish_client_lock = threading.Lock()
+_fish_client = None
 _urdu_lock = threading.Lock()
 _urdu_tokenizer = None
 _urdu_model = None
@@ -62,6 +82,30 @@ def _key() -> str:
             os.environ.get("GOOGLE_API_KEY") or "").strip()
 
 
+def _fish_key() -> str:
+    """Read Fish credentials from the environment only, never config."""
+    return (os.environ.get("FISH_API_KEY") or
+            os.environ.get("FISH_AUDIO_API_KEY") or "").strip()
+
+
+def _fish_reference_id() -> str:
+    return str(_speech().get("fish_reference_id") or "").strip()
+
+
+def fish_voice_status() -> tuple[bool, str]:
+    """Return readiness without logging a credential or the full voice ID."""
+    if not _fish_key():
+        return False, "api-key-missing"
+    reference_id = _fish_reference_id()
+    if not reference_id:
+        return False, "reference-voice-missing"
+    if not (8 <= len(reference_id) <= 128) or not all(
+        ch.isalnum() or ch in "_-" for ch in reference_id
+    ):
+        return False, "reference-voice-invalid"
+    return True, f"voice={reference_id[:8]}"
+
+
 def _provider(kind: str) -> str:
     return str(_speech().get(f"{kind}_provider") or "gemini").lower()
 
@@ -70,8 +114,35 @@ def gemini_stt_enabled() -> bool:
     return bool(_key() and _provider("stt") in {"auto", "gemini"})
 
 
+def gemini_live_stt_enabled() -> bool:
+    enabled = _speech().get("stt_live_enabled", True)
+    return bool(gemini_stt_enabled() and enabled and _stt_live_circuit.available())
+
+
 def gemini_tts_enabled() -> bool:
-    return bool(_key() and _provider("tts") in {"auto", "gemini"})
+    return bool(_key() and "gemini" in tts_provider_order())
+
+
+def fish_tts_enabled() -> bool:
+    ready, _ = fish_voice_status()
+    return bool(ready and "fish" in tts_provider_order())
+
+
+def tts_provider_order() -> tuple[str, ...]:
+    """Return a validated, de-duplicated cloud TTS failover route."""
+    speech = _speech()
+    primary = str(speech.get("tts_provider") or "fish").strip().lower()
+    raw_fallbacks = speech.get("tts_fallback_providers", ["gemini"])
+    if isinstance(raw_fallbacks, str):
+        raw_fallbacks = [raw_fallbacks]
+    requested = (["fish", "gemini"] if primary == "auto" else [primary])
+    requested.extend(raw_fallbacks or [])
+    result = []
+    for item in requested:
+        provider = str(item).strip().lower()
+        if provider in {"fish", "gemini"} and provider not in result:
+            result.append(provider)
+    return tuple(result or ("fish", "gemini"))
 
 
 def _headers(stream: bool = False) -> dict[str, str]:
@@ -87,6 +158,195 @@ def _timeout(kind: str, default: float) -> float:
         return max(5.0, float(_speech().get(f"{kind}_timeout_s", default)))
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(_speech().get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def _fish_http_client():
+    """One pooled client avoids a new TLS handshake for every sentence."""
+    global _fish_client
+    with _fish_client_lock:
+        if _fish_client is None:
+            _fish_client = httpx.Client(
+                limits=httpx.Limits(max_connections=4,
+                                    max_keepalive_connections=2,
+                                    keepalive_expiry=60.0),
+                follow_redirects=False,
+            )
+    return _fish_client
+
+
+_ROMAN_URDU_STRONG = {
+    "acha", "achha", "achhi", "batao", "dekho", "hoon", "hun",
+    "kaise", "karo", "karna", "kya", "kyun", "lekin", "mujhe",
+    "nahi", "nahin", "pasand", "samjhe", "shukriya", "tumhe",
+    "tumhein", "yaar",
+}
+_ROMAN_URDU_COMMON = {
+    "aaj", "agar", "aur", "bohat", "ek", "hai", "hain", "hota",
+    "hoti", "ka", "ke", "ki", "ko", "main", "mein", "mera",
+    "meri", "sab", "se", "theek", "ye", "woh",
+}
+
+
+def looks_like_roman_urdu(text: str) -> bool:
+    """Conservative language hint: avoid changing ordinary English delivery."""
+    words = re.findall(r"[a-z']+", str(text).casefold())
+    strong = sum(word in _ROMAN_URDU_STRONG for word in words)
+    common = sum(word in _ROMAN_URDU_COMMON for word in words)
+    return strong >= 2 or (strong >= 1 and common >= 2) or common >= 5
+
+
+def _fish_delivery(text: str, speech: dict) -> tuple[str, str, float, bool]:
+    """Return private synthesis text and quality settings; display text is untouched."""
+    roman_urdu = bool(speech.get("fish_roman_urdu_accent", True)
+                      and looks_like_roman_urdu(text))
+    latency = str(speech.get(
+        "fish_roman_urdu_latency" if roman_urdu else "fish_latency",
+        "balanced" if roman_urdu else "low",
+    )).strip().lower()
+    if latency not in {"low", "balanced", "normal"}:
+        latency = "balanced"
+    speed_key = "fish_roman_urdu_speed" if roman_urdu else "fish_speed"
+    speed = _bounded_float(speed_key, 1.0 if roman_urdu else 1.05, 0.5, 2.0)
+    if not roman_urdu:
+        return text, latency, speed, False
+    direction = str(speech.get("fish_roman_urdu_direction") or
+                    "speaking natural Pakistani Urdu with a warm native accent")
+    return f"[{direction}] {text}", latency, speed, True
+
+
+def stream_fish_tts(text: str):
+    """Yield decoded Fish Audio MP3 as mono int16 PCM.
+
+    The HTTP body is fed into ffmpeg while it arrives, so playback can begin
+    before the complete response has downloaded. The generator exposes only
+    decoded PCM; callers never need temporary files and cancellation can tear
+    down the decoder immediately.
+    """
+    if not fish_tts_enabled() or not _fish_tts_circuit.available():
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for Fish Audio MP3 decoding")
+
+    speech = _speech()
+    model = str(speech.get("fish_model") or "s2.1-pro-free")
+    reference_id = _fish_reference_id()
+    if not reference_id:
+        raise RuntimeError("Fish Audio reference voice is not configured")
+    delivery_text, latency, delivery_speed, roman_urdu = \
+        _fish_delivery(text, speech)
+    try:
+        chunk_length = max(100, min(300, int(speech.get("fish_chunk_length") or 200)))
+    except (TypeError, ValueError):
+        chunk_length = 200
+    payload = {
+        "text": delivery_text,
+        "format": "mp3",
+        "reference_id": reference_id,
+        "temperature": _bounded_float("fish_temperature", 0.2, 0.0, 1.0),
+        "top_p": _bounded_float("fish_top_p", 0.5, 0.0, 1.0),
+        "latency": latency,
+        "chunk_length": chunk_length,
+        "normalize": True,
+        "condition_on_previous_chunks": True,
+        "prosody": {
+            "speed": delivery_speed,
+            "volume": 0,
+            "normalize_loudness": True,
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {_fish_key()}",
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+        "model": model,
+    }
+    timeout_seconds = _timeout("fish_tts", 12.0)
+    proc = subprocess.Popen(
+        [ffmpeg, "-loglevel", "error", "-i", "pipe:0", "-f", "s16le",
+         "-ar", str(_FISH_RATE), "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        creationflags=(subprocess.CREATE_NO_WINDOW
+                       if os.name == "nt" else 0),
+    )
+    feed_error: list[Exception] = []
+    response_status: list[int | None] = [None]
+    encoded_bytes = [0]
+    started = time.monotonic()
+
+    def _feed() -> None:
+        try:
+            with _fish_http_client().stream(
+                    "POST", _FISH_URL, headers=headers, json=payload,
+                    timeout=timeout_seconds) as response:
+                response_status[0] = response.status_code
+                response.raise_for_status()
+                for chunk in response.iter_bytes(chunk_size=4096):
+                    if chunk:
+                        encoded_bytes[0] += len(chunk)
+                        proc.stdin.write(chunk)
+        except Exception as exc:
+            feed_error.append(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=_feed, name="fish-tts-feed", daemon=True)
+    feeder.start()
+    got_audio = False
+    first_audio_ms = None
+    try:
+        carry = b""
+        while True:
+            data = proc.stdout.read(4800)
+            if not data:
+                break
+            data = carry + data
+            usable = len(data) - (len(data) % 2)
+            carry = data[usable:]
+            if usable:
+                if not got_audio:
+                    first_audio_ms = round((time.monotonic() - started) * 1000)
+                got_audio = True
+                yield _FISH_RATE, np.frombuffer(
+                    data[:usable], dtype="<i2").copy()
+        feeder.join(timeout=1.0)
+        proc.wait(timeout=5.0)
+        if feed_error:
+            raise feed_error[0]
+        if not got_audio:
+            raise RuntimeError("Fish Audio returned no decodable speech")
+        _fish_tts_circuit.reset()
+        total_ms = round((time.monotonic() - started) * 1000)
+        log(f"[mouth] Fish TTS ok first_audio_ms={first_audio_ms} "
+            f"total_ms={total_ms} encoded_bytes={encoded_bytes[0]} "
+            f"model={model} voice={reference_id[:8]} "
+            f"latency={latency} roman_urdu={str(roman_urdu).lower()}")
+    except GeneratorExit:
+        proc.kill()
+        raise
+    except Exception as exc:
+        status = response_status[0]
+        _fish_tts_circuit.trip(quota=status == 429)
+        log(f"[mouth] Fish TTS unavailable "
+            f"(status={status or 'none'}; {type(exc).__name__}: "
+            f"{str(exc)[:100]})")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
 
 
 def _wav_bytes(pcm: np.ndarray, rate: int) -> bytes:
@@ -107,6 +367,170 @@ def _output_text(response: dict) -> str:
                    for step in response.get("steps") or []
                    for part in step.get("content") or []
                    if part.get("type") == "text").strip()
+
+
+def _merge_transcript(current: str, incoming: str) -> str:
+    """Merge Live API transcript events whether they are cumulative or incremental."""
+    current, incoming = current.strip(), incoming.strip()
+    if not incoming:
+        return current
+    if not current or incoming.startswith(current):
+        return incoming
+    if current.startswith(incoming):
+        return current
+    return f"{current} {incoming}".strip()
+
+
+class GeminiLiveTranscriber:
+    """Stream PTT audio while it is captured, leaving almost no release wait."""
+
+    def __init__(self, rate: int = 16000):
+        self.rate = rate
+        self._chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=640)
+        self._pending = bytearray()
+        self._cancelled = threading.Event()
+        self._done = threading.Event()
+        self._text = ""
+        self._error: Exception | None = None
+        self._started = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="gemini-live-stt")
+        self._thread.start()
+
+    def _put(self, data: bytes | None) -> None:
+        if self._done.is_set() or self._cancelled.is_set():
+            return
+        try:
+            self._chunks.put_nowait(data)
+        except queue.Full as exc:
+            self._error = RuntimeError("Gemini Live audio queue overflow")
+            self._cancelled.set()
+            raise self._error from exc
+
+    def feed(self, pcm: np.ndarray) -> None:
+        if self._done.is_set() or self._cancelled.is_set():
+            return
+        self._pending.extend(np.asarray(pcm, dtype="<i2").reshape(-1).tobytes())
+        chunk_bytes = max(2, int(self.rate * 0.1) * 2)
+        while len(self._pending) >= chunk_bytes:
+            data = bytes(self._pending[:chunk_bytes])
+            del self._pending[:chunk_bytes]
+            self._put(data)
+
+    def finish(self) -> str | None:
+        released = time.monotonic()
+        if self._pending:
+            self._put(bytes(self._pending))
+            self._pending.clear()
+        self._put(None)
+        timeout = _bounded_float("stt_live_finish_timeout_s", 3.0, 0.5, 8.0)
+        self._done.wait(timeout)
+        if not self._done.is_set():
+            self._cancelled.set()
+            log("[ears] Gemini Live final transcript timed out; trying batch Gemini")
+            return None
+        if self._error or not self._text.strip():
+            return None
+        _stt_live_circuit.reset()
+        log(f"[ears] Gemini Live STT ok post_release_ms="
+            f"{round((time.monotonic() - released) * 1000)} "
+            f"total_ms={round((time.monotonic() - self._started) * 1000)}")
+        return self._text.strip()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        try:
+            self._chunks.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        websocket = None
+        try:
+            from websockets.sync.client import connect
+            key = urllib.parse.quote(_key(), safe="")
+            url = f"{_LIVE_URL}?key={key}"
+            connect_timeout = _bounded_float(
+                "stt_live_connect_timeout_s", 4.0, 1.0, 10.0)
+            websocket = connect(url, open_timeout=connect_timeout,
+                                close_timeout=1.0, max_size=2**20)
+            speech = _speech()
+            transcription = {
+                "mode": str(speech.get("stt_mode") or "verbatim").upper(),
+                "languageCodes": list(speech.get("language_codes") or []),
+            }
+            vocabulary = [str(x).strip()
+                          for x in speech.get("custom_vocabulary") or []
+                          if str(x).strip()]
+            if vocabulary:
+                transcription["customVocabulary"] = vocabulary[:100]
+            setup = {
+                "setup": {
+                    "model": "models/" + str(speech.get(
+                        "gemini_stt_live_model") or
+                        "gemini-3.5-transcribe-live"),
+                    "generationConfig": {"responseModalities": ["TEXT"]},
+                    "realtimeInputConfig": {
+                        "automaticActivityDetection": {"disabled": True}},
+                    "inputAudioTranscription": transcription,
+                }
+            }
+            websocket.send(json.dumps(setup))
+            ack = json.loads(websocket.recv(timeout=connect_timeout))
+            if "setupComplete" not in ack:
+                raise RuntimeError("Gemini Live setup was not acknowledged")
+            websocket.send(json.dumps(
+                {"realtimeInput": {"activityStart": {}}}))
+            while not self._cancelled.is_set():
+                chunk = self._chunks.get()
+                if chunk is None:
+                    break
+                websocket.send(json.dumps({"realtimeInput": {"audio": {
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                    "mimeType": f"audio/pcm;rate={self.rate}",
+                }}}))
+            if self._cancelled.is_set():
+                return
+            websocket.send(json.dumps(
+                {"realtimeInput": {"activityEnd": {}}}))
+            deadline = time.monotonic() + _bounded_float(
+                "stt_live_finish_timeout_s", 3.0, 0.5, 8.0)
+            while not self._cancelled.is_set() and time.monotonic() < deadline:
+                try:
+                    event = json.loads(websocket.recv(
+                        timeout=max(0.05, deadline - time.monotonic())))
+                except TimeoutError:
+                    break
+                content = event.get("serverContent") or {}
+                interim = content.get("interimInputTranscription") or {}
+                final = content.get("inputTranscription") or {}
+                if interim.get("text"):
+                    self._text = _merge_transcript(self._text, interim["text"])
+                if final.get("text"):
+                    # The final event is authoritative and may revise wording
+                    # or casing from an interim hypothesis.
+                    self._text = str(final["text"]).strip()
+                    break
+                if content.get("turnComplete"):
+                    break
+        except Exception as exc:
+            self._error = exc
+            _stt_live_circuit.trip()
+            log(f"[ears] Gemini Live transcription unavailable "
+                f"({type(exc).__name__}); trying batch Gemini")
+        finally:
+            if websocket is not None:
+                try:
+                    websocket.close()
+                except Exception:
+                    pass
+            self._done.set()
+
+
+def start_gemini_live_transcriber(rate: int = 16000):
+    if not gemini_live_stt_enabled():
+        return None
+    return GeminiLiveTranscriber(rate)
 
 
 def try_gemini_transcribe(pcm: np.ndarray, rate: int = 16000) -> str | None:

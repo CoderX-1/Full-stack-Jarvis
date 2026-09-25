@@ -88,10 +88,17 @@ def patch(target: Path) -> None:
     speech_anchor = '    "base_url": "",\n'
     speech_defaults = (
         speech_anchor
-        + '    # Free-first multilingual speech with automatic local fallbacks.\n'
+        + '    # Provider-neutral speech with ordered cloud failover.\n'
         + '    "speech": {\n'
         + '        "stt_provider": "gemini",\n'
-        + '        "tts_provider": "gemini",\n'
+        + '        "tts_provider": "fish",\n'
+        + '        "tts_fallback_providers": ["gemini"],\n'
+        + '        "fish_model": "s2.1-pro-free",\n'
+        + '        "fish_reference_id": "",\n'
+        + '        "fish_tts_timeout_s": 12,\n'
+        + '        "fish_tts_failure_cooldown_s": 60,\n'
+        + '        "fish_tts_quota_cooldown_s": 900,\n'
+        + '        "allow_local_tts_fallback": True,\n'
         + '        "gemini_stt_model": "gemini-3.5-transcribe",\n'
         + '        "gemini_tts_model": "gemini-3.1-flash-tts-preview",\n'
         + '        "gemini_voice": "Charon",\n'
@@ -164,15 +171,27 @@ def transcribe(pcm: np.ndarray) -> str:
         yield KOKORO_RATE, pcm
 '''
     new_synth = '''def synth_stream(text: str, timeout: float = 30.0):
-    """Gemini streaming TTS first, then language-aware local fallbacks."""
+    """Fish Audio primary cloud TTS, Gemini fallback, local by policy."""
     from backtalk.speech_router import (
-        contains_urdu_script, gemini_tts_enabled, stream_gemini_tts,
-        stream_local_urdu,
+        contains_urdu_script, fish_tts_enabled, gemini_tts_enabled,
+        stream_fish_tts, stream_gemini_tts, stream_local_urdu,
+        tts_provider_order,
     )
-    if gemini_tts_enabled():
+    for provider in tts_provider_order():
+        if provider == "fish":
+            if not fish_tts_enabled():
+                log("[mouth] Fish TTS key missing; trying cloud fallback")
+                continue
+            generator = stream_fish_tts(text)
+        elif provider == "gemini":
+            if not gemini_tts_enabled():
+                continue
+            generator = stream_gemini_tts(text)
+        else:
+            continue
         cloud_started = False
         try:
-            for rate, pcm in stream_gemini_tts(text):
+            for rate, pcm in generator:
                 cloud_started = True
                 yield rate, pcm
             if cloud_started:
@@ -180,6 +199,9 @@ def transcribe(pcm: np.ndarray) -> str:
         except Exception:
             if cloud_started:
                 return
+    if not bool((CFG.get("speech") or {}).get(
+            "allow_local_tts_fallback", True)):
+        raise RuntimeError("cloud TTS route exhausted; local fallback disabled")
     if contains_urdu_script(text):
         try:
             yield from stream_local_urdu(text)
@@ -211,9 +233,9 @@ def transcribe(pcm: np.ndarray) -> str:
         "that file: use `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `AI_API_KEY` in "
         "the launcher's environment. Custom services also need `base_url` in "
         "the config. Re-run `fullstack-agent/provider_bridge/patch_backtalk.py` "
-        "after manually updating Backtalk. Speech uses Gemini 3.5 Transcribe "
-        "and Gemini 3.1 Flash TTS first, with local Whisper, MMS Urdu, and "
-        "Kokoro fallbacks.\n",
+        "after manually updating Backtalk. Speech uses Gemini transcription, "
+        "Fish Audio primary cloud TTS, and Gemini cloud TTS fallback. Local "
+        "TTS is controlled by the explicit allow_local_tts_fallback policy.\n",
         encoding="utf-8",
     )
     print(f"Patched Backtalk for Gemini/OpenAI APIs: {target}")

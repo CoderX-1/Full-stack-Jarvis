@@ -5,13 +5,127 @@ import socket
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 import agent
 from jarvis_mark2 import Mark2Runtime
 
 
 class Mark2RegistryTests(unittest.TestCase):
+    def test_web_research_uses_responses_search_and_returns_deduplicated_sources(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _limit=-1):
+                return json.dumps({
+                    "output": [
+                        {
+                            "type": "web_search_call",
+                            "action": {
+                                "sources": [
+                                    {"url": "https://example.com/report", "title": "Example Report"},
+                                ],
+                            },
+                        },
+                        {
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "The verified research answer.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://example.com/report",
+                                        "title": "Duplicate",
+                                    },
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://openai.com/news/",
+                                        "title": "OpenAI News",
+                                    },
+                                ],
+                            }],
+                        },
+                    ],
+                }).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "research-secret",
+                "OPENAI_MODEL": "gpt-test",
+            },
+            clear=False,
+        ), patch("urllib.request.urlopen", return_value=Response()) as mocked:
+            runtime = Mark2Runtime(Path(tmp))
+            result = runtime.execute(
+                "research_web",
+                {
+                    "query": "latest test fact",
+                    "max_sources": 5,
+                },
+            )
+
+        self.assertIn("The verified research answer.", result)
+        self.assertEqual(result.count("https://example.com/report"), 1)
+        self.assertIn("[2] OpenAI News - https://openai.com/news/", result)
+        request = mocked.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/responses")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.headers["Authorization"], "Bearer research-secret")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["model"], "gpt-test")
+        self.assertFalse(body["store"])
+        self.assertEqual(body["tools"], [{"type": "web_search"}])
+        self.assertEqual(body["include"], ["web_search_call.action.sources"])
+
+    def test_web_research_failure_is_truthful_and_does_not_leak_key(self):
+        failure = urllib.error.HTTPError(
+            "https://api.openai.com/v1/responses",
+            429,
+            "rate limited",
+            {},
+            None,
+        )
+        failure.read = lambda _limit=-1: json.dumps({
+            "error": {"message": "Rate limit reached; retry later."},
+        }).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"OPENAI_API_KEY": "never-print-this"}, clear=False,
+        ), patch("urllib.request.urlopen", side_effect=failure):
+            runtime = Mark2Runtime(Path(tmp))
+            result = runtime.execute("research_web", {"query": "private roadmap"})
+            runtime.audit("research_web", {"query": "private roadmap"}, result)
+            audit = runtime.audit_path.read_text(encoding="utf-8")
+
+        self.assertIn("HTTP 429", result)
+        self.assertNotIn("never-print-this", result + audit)
+        self.assertNotIn("private roadmap", audit)
+        event = json.loads(audit)
+        self.assertEqual(event["args"]["query"], "[REDACTED: web research query]")
+        self.assertEqual(event["result"], "[REDACTED: web research result]")
+
+    def test_web_research_rejects_untrusted_key_destination(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "secret",
+                "OPENAI_WEB_SEARCH_BASE_URL": "https://attacker.example/v1",
+            },
+            clear=False,
+        ):
+            runtime = Mark2Runtime(Path(tmp))
+            with self.assertRaisesRegex(ValueError, "untrusted host"):
+                runtime.research_web("test query")
+
     def test_register_list_search_and_audit_without_secrets(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

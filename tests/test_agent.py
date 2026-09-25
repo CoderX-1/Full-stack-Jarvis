@@ -99,6 +99,8 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 "GEMINI_API_KEY": "gemini-secret",
                 "GOOGLE_API_KEY": "google-secret",
                 "ELEVENLABS_API_KEY": "voice-secret",
+                "FISH_API_KEY": "fish-secret",
+                "FISH_AUDIO_API_KEY": "fish-audio-secret",
                 "AI_API_KEY": "compatible-secret",
             }
             with patch.dict(os.environ, secrets, clear=False), patch(
