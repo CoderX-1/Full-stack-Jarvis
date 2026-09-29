@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -82,6 +83,23 @@ class WindowsControl:
         "settings": "ms-settings:",
         "task manager": "taskmgr.exe",
     }
+
+    @staticmethod
+    def _available_alias_target(app_id: str) -> str:
+        """Only advertise aliases whose executable/protocol exists now."""
+        if app_id == "ms-settings:":
+            if os.name != "nt":
+                return ""
+            try:
+                import winreg
+
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "ms-settings"):
+                    return app_id
+            except OSError:
+                return ""
+        if app_id.casefold().endswith(".exe") and "\\" not in app_id and "/" not in app_id:
+            return shutil.which(app_id) or ""
+        return ""
 
     _VK = {
         "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "return": 0x0D,
@@ -355,7 +373,9 @@ $out | ConvertTo-Json -Compress
         for app in apps:
             by_name.setdefault(_norm(app["name"]), app)
         for alias, app_id in self._ALIASES.items():
-            by_name.setdefault(_norm(alias), {"name": alias.title(), "id": app_id})
+            target = self._available_alias_target(app_id)
+            if target:
+                by_name.setdefault(_norm(alias), {"name": alias.title(), "id": target})
         apps = list(by_name.values())
         apps.sort(key=lambda item: item["name"].casefold())
         self._apps_cache = (time.monotonic(), apps)
@@ -457,7 +477,9 @@ $out | ConvertTo-Json -Compress
             raise ValueError(f"App name is ambiguous. Matches: {names}")
         alias = self._ALIASES.get(clean.casefold())
         if alias:
-            return clean, alias
+            target = self._available_alias_target(alias)
+            if target:
+                return clean, target
         raise ValueError(f"App is not installed or was not found: {clean}")
 
     def _process_path(self, pid: int) -> str:
@@ -669,6 +691,10 @@ $out | ConvertTo-Json -Compress
     def launch_app(self, name: str, wait_seconds: int = 8) -> str:
         self._require_windows()
         display, app_id = self._resolve_app(name)
+        if Path(app_id).suffix.casefold() == ".lnk" and not Path(app_id).is_file():
+            return f"error: app shortcut for {display} is missing; no launch sent"
+        if Path(app_id).is_absolute() and not Path(app_id).is_file():
+            return f"error: app executable for {display} is missing; no launch sent"
         before = {(row["handle"], row["pid"]) for row in self.windows()}
         if app_id.startswith("ms-settings:") or Path(app_id).suffix.casefold() == ".lnk":
             os.startfile(app_id)  # type: ignore[attr-defined]

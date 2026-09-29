@@ -112,6 +112,30 @@ class FlorenceGrounder:
             })
         return matches, elapsed
 
+    def ocr(self, image: Any) -> tuple[str, float]:
+        """Run the model's offline OCR task on one bounded page image."""
+        task = "<OCR>"
+        inputs = self.processor(text=task, images=image, return_tensors="pt")
+        started = time.perf_counter()
+        with self.lock, self.torch.inference_mode():
+            generated = self.model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"].to(self.torch.float32),
+                max_new_tokens=768,
+                do_sample=False,
+                num_beams=1,
+                early_stopping=False,
+            )
+        elapsed = time.perf_counter() - started
+        generated_text = self.processor.batch_decode(
+            generated, skip_special_tokens=False
+        )[0]
+        parsed = self.processor.post_process_generation(
+            generated_text, task=task, image_size=(image.width, image.height)
+        )
+        answer = parsed.get(task) if isinstance(parsed, dict) else ""
+        return str(answer or "")[:10_000], elapsed
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "JarvisFlorence/1.0"
@@ -141,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_POST(self) -> None:
-        if self.path != "/ground":
+        if self.path not in {"/ground", "/ocr"}:
             self._send(404, {"error": "not-found"})
             return
         try:
@@ -151,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("invalid-request-size")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             query = str(payload.get("query") or "").strip()
-            if not query or len(query) > 300:
+            if self.path == "/ground" and (not query or len(query) > 300):
                 raise ValueError("invalid-query")
             image_bytes = base64.b64decode(str(payload.get("image") or ""), validate=True)
             if len(image_bytes) > 10_000_000:
@@ -162,8 +186,12 @@ class Handler(BaseHTTPRequestHandler):
             if image.width < 8 or image.height < 8 or image.width * image.height > 8_000_000:
                 raise ValueError("invalid-image-dimensions")
             grounder = self.server.grounder  # type: ignore[attr-defined]
-            matches, elapsed = grounder.ground(image, query)
-            self._send(200, {"matches": matches, "inference_seconds": round(elapsed, 3)})
+            if self.path == "/ocr":
+                text, elapsed = grounder.ocr(image)
+                self._send(200, {"text": text, "inference_seconds": round(elapsed, 3)})
+            else:
+                matches, elapsed = grounder.ground(image, query)
+                self._send(200, {"matches": matches, "inference_seconds": round(elapsed, 3)})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self._send(400, {"error": str(exc)[:120]})
         except Exception as exc:

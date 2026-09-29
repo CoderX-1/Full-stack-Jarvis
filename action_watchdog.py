@@ -30,6 +30,17 @@ class ActionLease:
 
 
 DEFAULT_DEADLINES: dict[str, float] = {
+    "recycle_created_file": 20.0,
+    "index_document": 120.0,
+    "research_pdf_report": 50.0,
+    "source_digest_pdf": 35.0,
+    "professional_source_report": 65.0,
+    "professional_topic_report": 90.0,
+    "professional_source_presentation": 65.0,
+    "professional_topic_presentation": 90.0,
+    "create_verified_app": 30.0,
+    "launch_generated_app": 20.0,
+    "forget_document": 15.0,
     "register_project": 15.0,
     "open_project": 20.0,
     "start_project": 70.0,
@@ -41,6 +52,7 @@ DEFAULT_DEADLINES: dict[str, float] = {
     "click_visual_target": 90.0,
     "save_diagnostic_snapshot": 30.0,
     "launch_app": 25.0,
+    "launch_android_app": 60.0,
     "open_item": 20.0,
     "control_window": 20.0,
     "send_keys": 30.0,

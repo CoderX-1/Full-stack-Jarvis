@@ -43,6 +43,49 @@ class VerificationDecision:
 # Every mutating tool must appear here. Tests compare this set with the public
 # tool registry so a newly added action cannot silently bypass verification.
 ACTION_CONTRACTS: dict[str, ActionContract] = {
+    "recycle_created_file": ActionContract(
+        "windows-recycle-bin-and-source-absence",
+        verified_markers=("recycled and verified:",),
+    ),
+    "index_document": ActionContract(
+        "passage-count-readback",
+        verified_markers=("indexed and verified", "already indexed:"),
+    ),
+    "research_pdf_report": ActionContract(
+        "new-file-exists-content-and-rendered-pages",
+        verified_markers=("pdf content and pages rendered",),
+    ),
+    "source_digest_pdf": ActionContract(
+        "new-source-digest-content-and-rendered-pages",
+        verified_markers=("pdf content and pages rendered",),
+    ),
+    "professional_source_report": ActionContract(
+        "new-evidence-brief-content-and-rendered-pages",
+        verified_markers=("pdf content and pages rendered",),
+    ),
+    "professional_topic_report": ActionContract(
+        "new-discovered-evidence-brief-content-and-rendered-pages",
+        verified_markers=("pdf content and pages rendered",),
+    ),
+    "professional_source_presentation": ActionContract(
+        "new-evidence-deck-package-and-editable-text",
+        observed_markers=("pptx package and editable slide text verified",),
+    ),
+    "professional_topic_presentation": ActionContract(
+        "new-discovered-evidence-deck-package-and-editable-text",
+        observed_markers=("pptx package and editable slide text verified",),
+    ),
+    "create_verified_app": ActionContract(
+        "immutable-app-version-manifest",
+        verified_markers=("verified app created:",),
+    ),
+    "launch_generated_app": ActionContract(
+        "app-integrity-and-process-readback",
+        verified_markers=("verified app launched:", "is already running; pid="),
+    ),
+    "forget_document": ActionContract(
+        "indexed-copy-deletion-readback", verified_markers=("forgot and verified",),
+    ),
     "register_project": ActionContract(
         "registry-readback", verified_markers=("registered project",),
     ),
@@ -84,6 +127,10 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
         "new-or-focused-app-window",
         verified_markers=("opened and verified",),
         observed_markers=("launch sent", "foreground verification="),
+    ),
+    "launch_android_app": ActionContract(
+        "android-foreground-package",
+        verified_markers=("verified android foreground package",),
     ),
     "open_item": ActionContract(
         "registered-application-handoff", delivered_markers=("opened ",),

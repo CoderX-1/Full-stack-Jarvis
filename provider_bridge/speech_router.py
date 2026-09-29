@@ -183,15 +183,17 @@ def _fish_http_client():
 
 
 _ROMAN_URDU_STRONG = {
-    "acha", "achha", "achhi", "batao", "dekho", "hoon", "hun",
-    "kaise", "karo", "karna", "kya", "kyun", "lekin", "mujhe",
-    "nahi", "nahin", "pasand", "samjhe", "shukriya", "tumhe",
-    "tumhein", "yaar",
+    "aap", "aapka", "acha", "achha", "achhi", "batao", "bht",
+    "bohat", "bohot", "bohut", "bolo", "chahta", "chahti",
+    "dekho", "hoon", "hun", "kaise", "karo", "karna", "kia",
+    "kya", "kyun", "lekin", "mujhe", "nahi", "nahin", "nhi",
+    "pasand", "raha", "rahe", "rha", "rhe", "sahi", "samjhe",
+    "shukriya", "sunao", "tumhe", "tumhein", "yaar", "yar",
 }
 _ROMAN_URDU_COMMON = {
-    "aaj", "agar", "aur", "bohat", "ek", "hai", "hain", "hota",
-    "hoti", "ka", "ke", "ki", "ko", "main", "mein", "mera",
-    "meri", "sab", "se", "theek", "ye", "woh",
+    "aaj", "agar", "aur", "ek", "hai", "hain", "hota", "hoti",
+    "ka", "kal", "ke", "ki", "ko", "main", "mein", "mera",
+    "meri", "sab", "se", "theek", "ye", "yeh", "woh",
 }
 
 

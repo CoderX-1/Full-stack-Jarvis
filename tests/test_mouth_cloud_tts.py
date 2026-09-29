@@ -1,5 +1,7 @@
 import importlib.util
+import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -21,8 +23,10 @@ def load_mouth(local_fallback=False):
     config.CFG = cfg
     vlog = types.ModuleType("backtalk.vlog")
     vlog.log = Mock()
-    path = (Path(__file__).parents[2] / "components" / "backtalk" /
-            "backtalk" / "mouth.py")
+    path = Path(os.environ.get("JARVIS_MOUTH_TEST_PATH") or (
+        Path(__file__).parents[2] / "components" / "backtalk" /
+        "backtalk" / "mouth.py"
+    ))
     name = "mouth_under_test"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -92,6 +96,69 @@ class MouthCloudRoutingTests(unittest.TestCase):
             self.assertIsNone(mouth.warm())
             self.assertTrue(mouth.preload_local_voice_runtime())
         self.assertIsNone(mouth._pipe)
+
+    def test_partial_fish_audio_failure_is_not_silent_success(self):
+        mouth = load_mouth()
+        router = router_stub()
+
+        def partial(_text):
+            yield 24000, np.array([1, 2], dtype=np.int16)
+            raise RuntimeError("secret request detail must stay private")
+
+        router.stream_fish_tts = Mock(side_effect=partial)
+        with patch.dict(sys.modules, {"backtalk.speech_router": router}):
+            generator = mouth.synth_stream("Hello")
+            self.assertEqual(next(generator)[0], 24000)
+            with self.assertRaisesRegex(RuntimeError, "spoken reply may be incomplete") as caught:
+                next(generator)
+        self.assertNotIn("secret request detail", str(caught.exception))
+        router.stream_gemini_tts.assert_not_called()
+
+    def test_both_cloud_providers_fail_before_audio_without_local_fallback(self):
+        mouth = load_mouth()
+        router = router_stub(fish_error=True)
+        router.stream_gemini_tts = Mock(side_effect=RuntimeError("Gemini offline"))
+        with patch.dict(sys.modules, {"backtalk.speech_router": router}):
+            with self.assertRaisesRegex(RuntimeError, "cloud TTS route exhausted"):
+                list(mouth.synth_stream("Hello"))
+        router.stream_local_urdu.assert_not_called()
+
+    def test_mouth_worker_reports_failure_without_leaking_and_processes_next_item(self):
+        mouth = load_mouth()
+        signals = types.ModuleType("backtalk.signals")
+        signals.reply_done = Mock()
+        signals.static_stop = Mock()
+        signals.set_state = Mock()
+        backtalk = types.ModuleType("backtalk")
+        backtalk.signals = signals
+
+        class TwoItems:
+            def __init__(self):
+                self.items = [("first", None), ("second", None)]
+
+            def get(self):
+                if self.items:
+                    return self.items.pop(0)
+                raise StopIteration
+
+            def empty(self):
+                return True
+
+        worker = types.SimpleNamespace(
+            _q=TwoItems(), _stop=threading.Event(),
+            _speaking=threading.Event(), _audible=threading.Event(),
+            ducker=types.SimpleNamespace(speech_end=Mock()),
+            _play_stream=Mock(side_effect=[RuntimeError("secret request detail"), None]),
+        )
+        with patch.dict(sys.modules, {"backtalk": backtalk, "backtalk.signals": signals}):
+            with self.assertRaises(StopIteration):
+                mouth.Mouth._run(worker)
+        self.assertEqual(worker._play_stream.call_count, 2)
+        self.assertEqual(signals.reply_done.call_count, 2)
+        self.assertFalse(worker._speaking.is_set())
+        messages = " ".join(str(call) for call in mouth.log.call_args_list)
+        self.assertIn("Speech delivery failed or ended early", messages)
+        self.assertNotIn("secret request detail", messages)
 
 
 if __name__ == "__main__":

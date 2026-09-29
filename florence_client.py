@@ -57,3 +57,26 @@ class FlorenceClient:
             return []
         matches = payload.get("matches") if isinstance(payload, dict) else None
         return matches[:20] if isinstance(matches, list) else []
+
+    def ocr(self, image: Any, timeout: float = 20.0) -> str | None:
+        """Return page text, or None when the offline worker is unavailable."""
+        if not self.enabled or image is None:
+            return None
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, "PNG", optimize=True)
+        raw_image = buffer.getvalue()
+        if len(raw_image) > 10_000_000:
+            return None
+        request = urllib.request.Request(
+            self.endpoint + "/ocr",
+            data=json.dumps({"image": base64.b64encode(raw_image).decode("ascii")}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=timeout) as response:
+                payload = json.loads(response.read(64_000).decode("utf-8"))
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        text = payload.get("text") if isinstance(payload, dict) else None
+        return text[:10_000] if isinstance(text, str) else None

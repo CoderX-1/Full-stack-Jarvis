@@ -7,6 +7,7 @@ methods return success only after inspecting a post-action browser state.
 from __future__ import annotations
 
 import atexit
+from collections import Counter
 import ctypes
 import importlib.util
 import os
@@ -216,7 +217,9 @@ class BrowserControl:
         if re.match(r"^https?://", value, re.IGNORECASE):
             return cls._validate_url(value)
         if re.fullmatch(r"(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?(?:/[^\s]*)?", value, re.IGNORECASE):
-            return cls._validate_url("https://" + value)
+            host = value.split("/", 1)[0].split(":", 1)[0].casefold()
+            scheme = "http" if host in {"localhost", "127.0.0.1"} else "https"
+            return cls._validate_url(scheme + "://" + value)
         if len(value) > 500:
             raise ValueError("browser search query is too long")
         return "https://www.google.com/search?q=" + urllib.parse.quote_plus(value)
@@ -357,11 +360,50 @@ class BrowserControl:
 
     def _command_navigate(self, page: Any, target: str = "") -> str:
         url = self.normalize_target(target)
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_timeout(350)
         actual = self._validate_url(page.url)
         title = str(page.title() or "").strip()[:200]
+        if response is None:
+            return f"unverified: browser loaded {actual[:1000]}, but no HTTP response was observed"
+        status = int(response.status)
+        if status >= 400 or status < 200:
+            return (
+                f"unverified: browser loaded {actual[:1000]}, but HTTP status "
+                f"was {status}; requested page was not verified"
+            )
+        if not self._destination_matches(url, actual):
+            return (
+                f"unverified: browser redirected to {actual[:1000]}; "
+                "requested destination was not observed"
+            )
         return f"Verified browser navigation | url={actual[:1000]} | title={title or '(untitled)'}"
+
+    @staticmethod
+    def _destination_matches(requested: str, actual: str) -> bool:
+        """Allow HTTPS upgrades and canonical www, not login/error redirects."""
+        want = urllib.parse.urlsplit(requested)
+        got = urllib.parse.urlsplit(actual)
+        if want.scheme == "https" and got.scheme != "https":
+            return False
+        if got.scheme not in {want.scheme, "https"}:
+            return False
+        want_host = (want.hostname or "").casefold()
+        got_host = (got.hostname or "").casefold()
+        if want_host.removeprefix("www.") != got_host.removeprefix("www."):
+            return False
+        if want.port != got.port:
+            want_default = 443 if want.scheme == "https" else 80
+            got_default = 443 if got.scheme == "https" else 80
+            if want.port not in {None, want_default} or got.port not in {None, got_default}:
+                return False
+        if (want.path.rstrip("/") or "/") != (got.path.rstrip("/") or "/"):
+            return False
+        wanted_query = Counter(urllib.parse.parse_qsl(want.query, keep_blank_values=True))
+        actual_query = Counter(urllib.parse.parse_qsl(got.query, keep_blank_values=True))
+        if any(actual_query[pair] < count for pair, count in wanted_query.items()):
+            return False
+        return not want.fragment or want.fragment == got.fragment
 
     def page_state(self, max_chars: int = 6000) -> str:
         if not self._session_active:

@@ -240,18 +240,29 @@ class AppFoundry:
 
     def launch(self, name: str) -> str:
         slug, version_dir, manifest = self._current(name)
+        if manifest.get("status") != "verified":
+            raise AppFoundryError("Only verified app versions can launch")
+        if manifest.get("slug") != slug or manifest.get("version") != version_dir.name:
+            raise AppFoundryError("App manifest identity mismatch; launch refused")
+        entrypoint = self._relative_file_path(str(manifest.get("entrypoint") or ""))
+        expected_files = manifest.get("files")
+        if not isinstance(expected_files, dict) or str(entrypoint) not in expected_files:
+            raise AppFoundryError("App manifest file list is invalid; launch refused")
+        for relative, expected in expected_files.items():
+            if not isinstance(relative, str) or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise AppFoundryError("App manifest file list is invalid; launch refused")
+            safe_relative = self._relative_file_path(relative)
+            target_file = version_dir.joinpath(*safe_relative.parts)
+            if target_file.is_symlink() or not target_file.is_file():
+                raise AppFoundryError(f"Bundle file missing or linked: {relative}; launch refused")
+            target_file.resolve().relative_to(version_dir)
+            actual = hashlib.sha256(target_file.read_bytes()).hexdigest()
+            if actual != expected:
+                raise AppFoundryError(f"Bundle integrity check failed: {relative}; launch refused")
+        target = version_dir.joinpath(*entrypoint.parts)
         existing = self._live.get(slug)
         if existing and existing.poll() is None:
             return f"Verified app {manifest['name']} is already running; pid={existing.pid}"
-        if manifest.get("status") != "verified":
-            raise AppFoundryError("Only verified app versions can launch")
-        entrypoint = self._relative_file_path(str(manifest.get("entrypoint") or ""))
-        target = version_dir.joinpath(*entrypoint.parts).resolve()
-        target.relative_to(version_dir)
-        expected = manifest.get("files", {}).get(str(entrypoint))
-        actual = hashlib.sha256(target.read_bytes()).hexdigest()
-        if not expected or actual != expected:
-            raise AppFoundryError("Entrypoint integrity check failed; launch refused")
         process = subprocess.Popen(
             [sys.executable, "-I", str(target)],
             cwd=version_dir,

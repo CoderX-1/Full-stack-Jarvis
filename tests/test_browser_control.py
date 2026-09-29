@@ -2,7 +2,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from browser_control import BrowserControl
 
@@ -15,6 +16,8 @@ class BrowserControlSafetyTests(unittest.TestCase):
             BrowserControl.normalize_target("jarvis browser verification"),
             "https://www.google.com/search?q=jarvis+browser+verification",
         )
+        self.assertEqual(BrowserControl.normalize_target("localhost:8000/health"), "http://localhost:8000/health")
+        self.assertEqual(BrowserControl.normalize_target("127.0.0.1:8000"), "http://127.0.0.1:8000")
 
     def test_unsafe_urls_and_credentials_are_rejected(self):
         for value in ("file:///c:/secret.txt", "javascript:alert(1)", "data:text/plain,x"):
@@ -68,6 +71,41 @@ class BrowserControlSafetyTests(unittest.TestCase):
             self.assertEqual(engine.browser.display_name, "Microsoft Edge")
             self.assertEqual(engine.profile_dir.name, "msedge")
             self.assertIn("system_default=false", engine.status())
+
+    def test_navigation_requires_requested_destination_and_successful_http_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = BrowserControl(Path(tmp))
+
+            def page(actual: str, status: int | None):
+                response = None if status is None else SimpleNamespace(status=status)
+                return SimpleNamespace(
+                    goto=Mock(return_value=response),
+                    wait_for_timeout=Mock(),
+                    url=actual,
+                    title=Mock(return_value="Example page"),
+                )
+
+            good = page("https://www.example.com/docs/?ref=guide&utm_source=test", 200)
+            result = engine._command_navigate(good, "https://example.com/docs?ref=guide")
+            self.assertIn("Verified browser navigation", result)
+            good.goto.assert_called_once()
+            self.assertTrue(BrowserControl._destination_matches(
+                "http://example.com:80/docs", "https://www.example.com:443/docs/"
+            ))
+
+            for actual, status in (
+                ("https://example.com/login", 200),
+                ("https://other.example/docs?ref=guide", 200),
+                ("https://example.com/docs?ref=wrong", 200),
+                ("https://example.com/docs?ref=guide", 404),
+                ("https://example.com/docs?ref=guide", None),
+                ("http://example.com/docs?ref=guide", 200),
+            ):
+                with self.subTest(actual=actual, status=status):
+                    result = engine._command_navigate(
+                        page(actual, status), "https://example.com/docs?ref=guide"
+                    )
+                    self.assertTrue(result.startswith("unverified:"), result)
 
 
 if __name__ == "__main__":

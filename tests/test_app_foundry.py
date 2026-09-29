@@ -89,6 +89,22 @@ class AppFoundryTests(unittest.TestCase):
         with self.assertRaisesRegex(AppFoundryError, "integrity check failed"):
             self.foundry.launch("focus timer")
 
+    def test_launch_refuses_changed_secondary_bundle_file(self) -> None:
+        self._create()
+        current = next(self.foundry.root.glob("focus-timer/versions/*"))
+        (current / "settings.json").write_text('{"minutes": 5}', encoding="utf-8")
+        with self.assertRaisesRegex(AppFoundryError, "Bundle integrity check failed: settings.json"):
+            self.foundry.launch("focus timer")
+        self.assertFalse(self.foundry._live)
+
+    def test_running_app_does_not_hide_later_bundle_tampering(self) -> None:
+        self._create()
+        self.foundry.launch("focus timer")
+        current = next(self.foundry.root.glob("focus-timer/versions/*"))
+        (current / "settings.json").write_text('{"minutes": 5}', encoding="utf-8")
+        with self.assertRaisesRegex(AppFoundryError, "Bundle integrity check failed: settings.json"):
+            self.foundry.launch("focus timer")
+
     def test_clean_environment_removes_credentials(self) -> None:
         os.environ["APP_FOUNDRY_TEST_API_KEY"] = "never-pass-this"
         try:

@@ -1,0 +1,5 @@
+# Isolated optional PDF report runtime, installed under core/.artifact-deps.
+reportlab==5.0.1
+pillow==12.3.0
+charset-normalizer==3.5.1
+pypdfium2==5.0.0
